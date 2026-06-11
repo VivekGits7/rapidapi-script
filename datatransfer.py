@@ -9,6 +9,8 @@ GIN indexes need pg_trgm).
 
 WHICH TABLES — you pick them. Set the `TABLES` list below, or pass `--tables`.
 If left empty, it transfers every `rapid_api_*` table found in the source.
+Put "*" in the list (or `--tables '*'`) to transfer EVERY table in the source's
+public schema — a full, faithful copy of all tables + data.
 
 Give credentials any of three ways (first found wins, per field):
   1. CLI flags:  --src-host / --dst-host / --tables …  (see --help)
@@ -61,7 +63,10 @@ DEST = {
 
 # TABLES to transfer. List the exact table names you want.
 # Leave EMPTY ([]) to transfer every rapid_api_* table found in the source.
+# Put "*" to transfer EVERY table in the source's public schema (full copy).
 TABLES: list[str] = [
+    "*" 
+    # "*",
     # "rapid_api_articles",
     # "rapid_api_models",
 ]
@@ -109,11 +114,60 @@ def _discover_rapid_api(psql: str, creds: dict) -> list:
     return [n for n in (names or "").split(",") if n]
 
 
+def _discover_all_tables(psql: str, creds: dict) -> list:
+    """Every base table in the source's public schema that the user can READ.
+
+    The privilege filter matters: information_schema lists tables you can't
+    SELECT (e.g. owned by another role) — pg_dump would die on those.
+    """
+    names = _psql_scalar(
+        psql, creds,
+        "SELECT string_agg(table_name, ',') FROM information_schema.tables "
+        "WHERE table_schema='public' AND table_type='BASE TABLE' "
+        "AND has_table_privilege(format('%I.%I', table_schema, table_name), 'SELECT');",
+    )
+    return [n for n in (names or "").split(",") if n]
+
+
 def _count(psql: str, creds: dict, table: str) -> int:
     try:
         return int(_psql_scalar(psql, creds, f'SELECT count(*) FROM public."{table}";'))
     except Exception:
         return -1  # table missing
+
+
+def _sync_enum_types(psql: str, src: dict, dst: dict) -> None:
+    """Create the source's custom enum types on dest (pg_dump --table omits them).
+
+    Without this, restoring into a FRESH database fails with
+    'type "public.rapid_api_dump_state" does not exist'. Existing types on dest
+    are left untouched (duplicate_object is swallowed).
+    """
+    rows = _psql_scalar(
+        psql, src,
+        "SELECT string_agg(t.typname || '|' || vals, ';') FROM ("
+        "  SELECT t.typname, string_agg(quote_literal(e.enumlabel), ', ' ORDER BY e.enumsortorder) AS vals"
+        "  FROM pg_type t"
+        "  JOIN pg_enum e ON e.enumtypid = t.oid"
+        "  JOIN pg_namespace n ON n.oid = t.typnamespace"
+        "  WHERE n.nspname = 'public'"
+        "  GROUP BY t.typname) t;",
+    )
+    if not rows:
+        return
+    for entry in rows.split(";"):
+        if "|" not in entry:
+            continue
+        typname, vals = entry.split("|", 1)
+        try:
+            _psql_scalar(
+                psql, dst,
+                f"DO $$ BEGIN CREATE TYPE public.\"{typname}\" AS ENUM ({vals}); "
+                f"EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+            )
+            print(f"  enum type synced: {typname}")
+        except Exception as e:
+            print(f"  warn: could not sync enum type {typname}: {e}")
 
 
 # ==================== main ====================
@@ -125,7 +179,7 @@ def main() -> None:
         ap.add_argument(f"--{side}-db", default=d["dbname"])
         ap.add_argument(f"--{side}-user", default=d["user"])
         ap.add_argument(f"--{side}-password", default=d["password"])
-    ap.add_argument("--tables", default="", help="Comma-separated table names. Empty = all rapid_api_* tables.")
+    ap.add_argument("--tables", default="", help="Comma-separated table names. Empty = all rapid_api_* tables. '*' = ALL tables in the source's public schema.")
     ap.add_argument("--keep-file", action="store_true", help="Keep the intermediate .sql dump file")
     args = ap.parse_args()
 
@@ -157,7 +211,14 @@ def main() -> None:
     except Exception as e:
         sys.exit(f"ERROR: cannot reach DEST — {e}")
 
-    if not tables:
+    star_mode = "*" in tables
+    if star_mode:
+        # '*' = full copy: every READABLE base table in the source's public schema.
+        tables = _discover_all_tables(psql, src)
+        if not tables:
+            sys.exit("ERROR: SOURCE has no readable tables in the public schema. Nothing to transfer.")
+        print(f"TABLES : (* — ALL public tables) {len(tables)} tables")
+    elif not tables:
         tables = _discover_rapid_api(psql, src)
         if not tables:
             sys.exit("ERROR: no rapid_api_* tables in SOURCE and no --tables given. Nothing to transfer.")
@@ -167,8 +228,15 @@ def main() -> None:
 
     src_counts = {t: _count(psql, src, t) for t in tables}
     missing = [t for t, c in src_counts.items() if c < 0]
-    if missing:
-        sys.exit(f"ERROR: these tables don't exist in SOURCE: {', '.join(missing)}")
+    if missing and star_mode:
+        # '*' mode: best-effort — skip tables we can't read (permissions/RLS) and continue.
+        print(f"  warn: skipping {len(missing)} unreadable table(s): {', '.join(missing)}")
+        tables = [t for t in tables if src_counts[t] >= 0]
+        src_counts = {t: src_counts[t] for t in tables}
+        if not tables:
+            sys.exit("ERROR: no readable tables left to transfer.")
+    elif missing:
+        sys.exit(f"ERROR: these tables don't exist in SOURCE (or aren't readable): {', '.join(missing)}")
     print(f"Source rows: {sum(src_counts.values())} across {len(tables)} tables.\n")
 
     # ensure required extensions on DEST (trigram GIN indexes need pg_trgm)
@@ -177,6 +245,10 @@ def main() -> None:
             _psql_scalar(psql, dst, f"CREATE EXTENSION IF NOT EXISTS {ext};")
         except Exception as e:
             print(f"  warn: could not create extension {ext} on dest: {e}")
+
+    # ensure the source's custom enum types exist on DEST (pg_dump --table omits
+    # them; a fresh dest DB would otherwise fail on 'type ... does not exist')
+    _sync_enum_types(psql, src, dst)
 
     # dump SOURCE → temp .sql (clean+if-exists makes the restore idempotent)
     fd, dump_path = tempfile.mkstemp(prefix="datatransfer_", suffix=".sql")

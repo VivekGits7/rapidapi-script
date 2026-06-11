@@ -212,6 +212,22 @@ CREATE INDEX idx_rapid_api_vca_category         ON rapid_api_vehicle_categories(
 CREATE INDEX idx_rapid_api_vca_articles_pending ON rapid_api_vehicle_categories(vca_id) WHERE articles_fetched_at IS NULL;
 
 -- ==========================================================================
+-- PRODUCT NAMES — the TecDoc productId → generic product-type name dictionary.
+-- Fetched ONCE per language from /category/list-products-names/lang-id/{4,42}
+-- (2 API calls, ~11k rows). Fills articles.product_name_ar locally at list time
+-- (replaces ~994k per-category Arabic article-list calls). Articles FK into it
+-- via product_id, so both tables join on the TecDoc productId directly.
+-- ==========================================================================
+CREATE TABLE rapid_api_product_names (
+    product_name_id      UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    products_external_id INT          NOT NULL UNIQUE,    -- API: productId (FK target for articles.product_id)
+    product_name_en      VARCHAR(500),                    -- API: productName (lang 4)
+    product_name_ar      VARCHAR(500),                    -- API: productName (lang 42)
+    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- ==========================================================================
 -- ARTICLES (parts) — ONE row per unique TecDoc articleId.
 -- STORE-ALL, COMPLETE TOP-N:
 --   Every article found in any (vehicle, category) list is stored here with the
@@ -228,7 +244,7 @@ CREATE TABLE rapid_api_articles (
     articles_external_id INT          NOT NULL UNIQUE,    -- API: articleId  (dedup key)
     article_no           VARCHAR(100),                    -- API: articleNo
     supplier_name        VARCHAR(255),                    -- API: supplierName = the PART BRAND (BOSCH, FEBI…) — language-neutral
-    product_id           INT,                             -- API: productId (TecDoc generic article)
+    product_id           INT          REFERENCES rapid_api_product_names(products_external_id) ON DELETE SET NULL,  -- API: productId (TecDoc generic article)
     product_name_en      VARCHAR(500),                    -- API: articleProductName (EN)
     product_name_ar      VARCHAR(500),                    -- API: articleProductName (AR, lang 42; filled on complete-details)
     ean_no               VARCHAR(255),                    -- complete-details: eanNo

@@ -1,6 +1,6 @@
-"""Phase 1 — Reference data (Languages, Countries, Vehicle Types).
+"""Phase 1 — Reference data (Languages, Countries, Vehicle Types, Product Names).
 
-BFS, 3 fixed API calls. Idempotent: re-running is safe (existence checks + ON CONFLICT DO NOTHING).
+BFS, 5 fixed API calls. Idempotent: re-running is safe (existence checks + ON CONFLICT DO NOTHING).
 """
 
 import asyncio
@@ -8,6 +8,7 @@ import uuid
 
 from config import settings
 from logger import get_logger
+from dumper import product_names
 from dumper.http_client import api_get
 from dumper.state import API_NAME_TO_CODE
 from dumper.unparsed import UnparsedEntity, UnparsedReason, log_unparsed
@@ -17,11 +18,14 @@ logger = get_logger("dumper.phase1")
 
 
 async def run(job_id: str) -> dict:
-    logger.info("Phase 1 — Reference (Languages, Countries, Vehicle Types)")
+    logger.info("Phase 1 — Reference (Languages, Countries, Vehicle Types, Product Names)")
 
     await _fetch_languages()
     await _fetch_countries()
     await _fetch_vehicle_types()
+    # productId → name dictionary (EN+AR, 2 calls) — fills product_name_ar locally
+    # so the article crawl never needs the Arabic list call again.
+    await product_names.fetch_and_store()
 
     counts = await _final_counts()
 

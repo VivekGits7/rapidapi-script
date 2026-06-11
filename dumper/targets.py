@@ -109,27 +109,42 @@ async def seed_targets_from_csv() -> dict:
 
 # ==================== LINE-ORDER ITERATION ====================
 
-async def next_target(exclude_ids: Optional[list] = None) -> Optional[asyncpg.Record]:
-    """Return the next not-complete target, A→Z by make then model.
+async def claim_next_target(
+    exclude_ids: Optional[list] = None,
+    makes: Optional[list[int]] = None,
+) -> Optional[asyncpg.Record]:
+    """Atomically CLAIM the next not-complete target, A→Z by make then model.
 
-    Prefers RESUMABLE (work already started) before PENDING, so an interrupted
-    make is finished before a fresh one is begun. `exclude_ids` skips targets
-    already attempted-but-incomplete this run (deferred to the next run).
+    The claim flips status → 'resumable' in the same statement under
+    FOR UPDATE SKIP LOCKED, so concurrent workers (or separate --makes
+    processes) can never grab the same target simultaneously. Prefers
+    RESUMABLE (work already started) before PENDING. `exclude_ids` skips
+    targets already attempted or currently in flight this run; `makes`
+    restricts claiming to those tec_manufacturer_ids (--makes flag).
     """
     return await execute_query_one(
         """
-        SELECT target_id, tec_manufacturer_id, tec_manufacturer_name,
-               tec_model_id, tec_model_name, status
-        FROM rapid_api_dump_targets
-        WHERE status <> $1
-          AND NOT (target_id = ANY($3::uuid[]))
-        ORDER BY (status = $2) DESC,
-                 tec_manufacturer_name ASC, tec_model_name ASC
-        LIMIT 1
+        UPDATE rapid_api_dump_targets t
+        SET status = $2, started_at = COALESCE(t.started_at, NOW()), updated_at = NOW()
+        FROM (
+            SELECT target_id
+            FROM rapid_api_dump_targets
+            WHERE status <> $1
+              AND NOT (target_id = ANY($3::uuid[]))
+              AND (cardinality($4::int[]) = 0 OR tec_manufacturer_id = ANY($4::int[]))
+            ORDER BY (status = $2) DESC,
+                     tec_manufacturer_name ASC, tec_model_name ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        ) pick
+        WHERE t.target_id = pick.target_id
+        RETURNING t.target_id, t.tec_manufacturer_id, t.tec_manufacturer_name,
+                  t.tec_model_id, t.tec_model_name, t.status
         """,
         TargetStatus.COMPLETE.value,
         TargetStatus.RESUMABLE.value,
         exclude_ids or [],
+        makes or [],
     )
 
 

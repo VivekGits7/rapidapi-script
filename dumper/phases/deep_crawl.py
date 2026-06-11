@@ -24,6 +24,11 @@ from services.db import bulk_insert, execute_command, execute_command_with_retur
 
 logger = get_logger("dumper.crawl")
 
+# categories_external_id → category_id uuid, shared across ALL vehicles/workers.
+# Safe: categories are globally unique per (external_id, vehicle_type, lang), both
+# constant within a run; a rare concurrent miss just re-upserts idempotently.
+_cat_id_cache: dict[int, str] = {}
+
 
 # ==================== VEHICLES (store all, rank latest-first) ====================
 async def fetch_vehicles_for_model(
@@ -181,7 +186,7 @@ async def fetch_categories_for_vehicle(vehicle: asyncpg.Record) -> None:
         cats = {}
 
     ar_names = _index_categories_ar(ar_data)
-    cache: dict[int, str] = {}
+    cache = _cat_id_cache  # module-level: vehicle #2..N reuse uuids resolved by #1
     cat_ids: list[Any] = []
     sort = 0
     for root_name, root_node in cats.items():
@@ -206,7 +211,7 @@ async def fetch_categories_for_vehicle(vehicle: asyncpg.Record) -> None:
     await execute_command(
         "UPDATE rapid_api_vehicles SET categories_fetched_at = NOW() WHERE vehicle_id = $1", vehicle_id,
     )
-    logger.info(f"  Categories for vehicle {vehicle_id}: {len(cache)} nodes, {len(unique_ids)} links (1 batch)")
+    logger.info(f"  Categories for vehicle {vehicle_id}: {len(unique_ids)} links (1 batch, {len(cache)} cached nodes)")
 
 
 def _index_categories_ar(ar_data) -> dict:

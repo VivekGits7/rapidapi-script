@@ -59,7 +59,8 @@ class Settings(BaseSettings):
     RAPIDAPI_RATE_LIMIT_PER_SEC: int = Field(default=20, description="Global RapidAPI rate limit (requests/second) — plan hard limit")
     MONTHLY_REQUEST_HARD_LIMIT: int = Field(default=100_000, description="RapidAPI monthly request hard limit (plan)")
     MONTHLY_REQUEST_SAFETY_BUFFER: int = Field(default=500, description="Stop this many calls BEFORE the monthly hard limit, to never overshoot")
-    COOLDOWN_429_SEC: int = Field(default=60, description="Cooldown after 429 (per-minute rate limit)")
+    # 5s, not 60: the token bucket prevents 429s; a stray one must not stall every worker for a minute.
+    COOLDOWN_429_SEC: int = Field(default=5, description="Cooldown after 429 (per-second burst limit)")
     COOLDOWN_403_SEC: int = Field(default=3600, description="Cooldown after 403 (likely quota exhausted)")
     COOLDOWN_5XX_SEC: int = Field(default=10, description="Cooldown after 5xx server error")
     KEY_EXHAUSTION_THRESHOLD_SEC: int = Field(
@@ -71,7 +72,22 @@ class Settings(BaseSettings):
     # only this many times before falling back to the lighter per-article endpoints, so we don't
     # burn ~30s/timeout × many retries per article.
     COMPLETE_DETAILS_MAX_RETRIES: int = Field(default=1, description="Retries for the complete-details call before falling back to individual-details + compat-cars")
+    # The healthy endpoint answers in ~1s; a hang otherwise idles a details slot for the
+    # full 30s global timeout. 12s catches slow-but-alive responses, fails hung ones fast.
+    COMPLETE_DETAILS_TIMEOUT: float = Field(default=12.0, description="HTTP timeout (seconds) for the flaky complete-details endpoint only")
     BATCH_SIZE: int = Field(default=100, description="Article ids per batch for specs/OEM endpoints")
+
+    # ==================== PARALLEL CRAWL (workers + token bucket) ====================
+    # One process, N concurrent target-workers, all sharing ONE token bucket that
+    # caps the combined API rate. Workers = lanes; rate = the speed limit.
+    DUMP_WORKERS: int = Field(default=8, description="Concurrent target (make/model) workers in one process")
+    DUMP_RATE_PER_SEC: float = Field(default=18.0, description="Global token-bucket fill rate (req/s) — keep under the plan's 20/s")
+    LIST_FANOUT: int = Field(default=8, description="Concurrent leaf-category article-list fetches per target")
+    DETAILS_FANOUT: int = Field(default=4, description="Concurrent article-details fetches per target")
+    KEY_FLUSH_INTERVAL_SEC: float = Field(default=5.0, description="Seconds between key/quota counter flushes to the DB")
+    KEY_FLUSH_MAX_PENDING: int = Field(default=200, description="Force a counter flush after this many unflushed calls")
+    HEARTBEAT_INTERVAL_SEC: float = Field(default=5.0, description="Job heartbeat + stop-flag poll cadence (seconds)")
+    POSTGRES_POOL_MAX: int = Field(default=30, description="asyncpg pool max connections")
 
     # ==================== TARGET FILTER (dump_targets.csv) ====================
     DUMP_TARGETS_CSV: str = Field(default="dump_targets.csv", description="Path to the make/model target seed CSV")
@@ -97,10 +113,9 @@ class Settings(BaseSettings):
 
     # ==================== DERIVED PROPERTIES ====================
     @property
-    def request_interval_sec(self) -> float:
-        """Seconds to wait between API calls to hold RAPIDAPI_RATE_LIMIT_PER_SEC globally."""
-        rate = max(1, self.RAPIDAPI_RATE_LIMIT_PER_SEC)
-        return 1.0 / rate
+    def effective_rate_per_sec(self) -> float:
+        """Token-bucket fill rate, never above the plan's hard per-second limit."""
+        return min(float(self.DUMP_RATE_PER_SEC), float(self.RAPIDAPI_RATE_LIMIT_PER_SEC))
 
     @property
     def monthly_request_ceiling(self) -> int:

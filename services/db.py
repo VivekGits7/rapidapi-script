@@ -28,7 +28,7 @@ async def create_db_pool() -> None:
         password=settings.POSTGRES_DB_PASSWORD,
         database=settings.POSTGRES_DB_NAME,
         min_size=2,
-        max_size=20,
+        max_size=settings.POSTGRES_POOL_MAX,
         command_timeout=60,
     )
     logger.info(

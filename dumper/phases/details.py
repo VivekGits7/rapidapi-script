@@ -36,7 +36,7 @@ from dumper.http_client import api_get
 from dumper.state import DumpEntityState, DumpStage, StopRequested
 from dumper.unparsed import UnparsedEntity, UnparsedReason, log_unparsed
 from logger import get_logger
-from services.db import bulk_insert, execute_command, execute_query_one
+from services.db import bulk_insert, execute_command, execute_query
 
 logger = get_logger("dumper.details")
 
@@ -47,36 +47,70 @@ _FALLBACK_COMPAT_PATH = "/articles/get-compatible-cars-by-article-number/type-id
 
 
 async def complete_articles_for_model(model_id: str, check_stop=None) -> bool:
-    """Fetch complete-details for the model's top-rank incomplete articles.
+    """Fetch complete-details for the model's top-rank incomplete articles with a
+    SLIDING WINDOW of DETAILS_FANOUT articles (each article is an EN+AR pair):
+    a finished slot is refilled immediately, so one hung request (the flaky
+    endpoint's 12s timeout) never idles the other slots.
 
-    Returns True when none are left pending, False if an API call failed. Raises
-    StopRequested if `check_stop()` is truthy between articles (each completed
-    article is committed → resume continues from the next incomplete one).
+    Returns True when none are left pending, False if an API call failed (window
+    drains, no re-claim — retry next run). Raises StopRequested when `check_stop()`
+    turns truthy (each completed article is already committed → resume continues
+    from the next incomplete one).
     """
     cap = settings.MAX_ARTICLES_PER_CATEGORY
+    fanout = max(1, settings.DETAILS_FANOUT)
+    in_flight: dict[asyncio.Task, Any] = {}  # task → article_id
+    claimed: set = set()                     # article_ids currently in flight
+    ok_all = True
+    stopping = False
+
     while True:
-        if check_stop is not None and await check_stop():
-            raise StopRequested()
-        row = await execute_query_one(
-            """
-            SELECT DISTINCT a.article_id, a.articles_external_id
-            FROM rapid_api_category_articles ca
-            JOIN rapid_api_articles a ON a.article_id = ca.article_id
-            JOIN rapid_api_vehicles v ON v.vehicle_id = ca.vehicle_id
-            WHERE v.model_id = $1
-              AND ($2 = 0 OR ca.rank <= $2)
-              AND a.dump_state = $3
-            ORDER BY a.article_id
-            LIMIT 1
-            """,
-            model_id, cap, DumpEntityState.INCOMPLETE.value,
-        )
-        if not row:
-            return True
-        ok = await _complete_article(row["article_id"], int(row["articles_external_id"]))
-        if not ok:
-            logger.error(f"complete-details failed for article {row['article_id']} — retry next run")
-            return False
+        if not stopping and check_stop is not None and await check_stop():
+            stopping = True
+
+        # Top up the window while healthy (failures/stop let it drain instead).
+        if ok_all and not stopping:
+            need = fanout - len(in_flight)
+            if need > 0:
+                rows = await execute_query(
+                    """
+                    SELECT DISTINCT a.article_id, a.articles_external_id
+                    FROM rapid_api_category_articles ca
+                    JOIN rapid_api_articles a ON a.article_id = ca.article_id
+                    JOIN rapid_api_vehicles v ON v.vehicle_id = ca.vehicle_id
+                    WHERE v.model_id = $1
+                      AND ($2 = 0 OR ca.rank <= $2)
+                      AND a.dump_state = $3
+                      AND NOT (a.article_id = ANY($4::uuid[]))
+                    ORDER BY a.article_id
+                    LIMIT $5
+                    """,
+                    model_id, cap, DumpEntityState.INCOMPLETE.value, list(claimed), need,
+                )
+                for r in rows:
+                    task = asyncio.create_task(_complete_article(r["article_id"], int(r["articles_external_id"])))
+                    in_flight[task] = r["article_id"]
+                    claimed.add(r["article_id"])
+
+        if not in_flight:
+            if stopping:
+                raise StopRequested()
+            return ok_all
+
+        done, _ = await asyncio.wait(set(in_flight), return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            article_id = in_flight.pop(task)
+            claimed.discard(article_id)
+            exc = task.exception()
+            if exc is not None:
+                # Quota/fatal errors: drain the window, then propagate to the worker.
+                if in_flight:
+                    await asyncio.gather(*in_flight, return_exceptions=True)
+                    in_flight.clear()
+                raise exc
+            if task.result() is False:
+                ok_all = False
+                logger.error(f"complete-details failed for article {article_id} — retry next run")
 
 
 async def _complete_article(article_id: str, external_id: int) -> bool:
@@ -99,16 +133,17 @@ async def _fetch_complete_details(external_id: int):
     retry cap, so we fall back fast instead of burning the global retry budget."""
     path = _DETAILS_PATH.format(type_id=settings.DEFAULT_TYPE_ID)
     retries = settings.COMPLETE_DETAILS_MAX_RETRIES
+    timeout = settings.COMPLETE_DETAILS_TIMEOUT
     en_params = {"articleId": external_id, "langId": settings.DEFAULT_LANG_ID,
                  "countryFilterId": settings.DEFAULT_COUNTRY_FILTER_ID}
     if settings.BILINGUAL:
         ar_params = {"articleId": external_id, "langId": settings.ARABIC_LANG_ID,
                      "countryFilterId": settings.DEFAULT_COUNTRY_FILTER_ID}
         return await asyncio.gather(
-            api_get(path, params=en_params, max_retries=retries),
-            api_get(path, params=ar_params, max_retries=retries),
+            api_get(path, params=en_params, max_retries=retries, timeout=timeout),
+            api_get(path, params=ar_params, max_retries=retries, timeout=timeout),
         )
-    return await api_get(path, params=en_params, max_retries=retries), None
+    return await api_get(path, params=en_params, max_retries=retries, timeout=timeout), None
 
 
 def _has_usable_details(art: Any) -> bool:

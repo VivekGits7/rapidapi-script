@@ -73,6 +73,55 @@ guvrun -m dumper.cli reset --yes-i-am-sure   # DANGER: truncate all dump tables
 > this run — **not** vehicles/articles within a target. Omit (or `0`) = process
 > all, resuming where it left off. `--limit 1` = one target = a smoke test.
 
+### Parallel crawl flags (`--workers` / `--rate` / `--makes`)
+
+> Design rationale + the full optimization story: **`archive/OPTIMIZATION_PLAN.md`**.
+
+```bash
+guvrun -m dumper.cli run --workers 8 --rate 18 --makes 5,16,21 --limit 10
+```
+
+| Flag | Meaning |
+|---|---|
+| `--workers 8` | How many **targets (models) are crawled simultaneously** inside one process. Each worker atomically claims a target (`FOR UPDATE SKIP LOCKED` — two workers can never grab the same model), crawls it to full depth, then claims the next. |
+| `--rate 18` | **Global speed limit (req/s)** — a token bucket shared by ALL workers combined. Plan allows 20/s; 18 leaves margin so a 429 never cooldown-stalls the single key. |
+| `--makes 5,16,21` | Only claim targets of these `tec_manufacturer_id`s (5 = AUDI, 16 = BMW, 21 = CITROËN). Omit = all 508 targets, A→Z. |
+| `--limit 10` | Stop after N targets **total across all workers**, then pause cleanly. |
+
+**workers × rate intuition:** workers = how many lanes the highway has; rate = the
+speed limit for ALL cars combined. More lanes keep the road full; the limit caps
+total throughput. Workers don't multiply API load — the bucket does the capping;
+workers just guarantee there's always work ready to spend the budget.
+
+Every flag has a config default (`DUMP_WORKERS`, `DUMP_RATE_PER_SEC` in `.env`),
+so plain `guvrun -m dumper.cli run` does the right thing with zero flags.
+
+**Common recipes:**
+
+```bash
+guvrun -m dumper.cli run --workers 8 --rate 18            # full speed, everything
+guvrun -m dumper.cli run --limit 1 --workers 2 --rate 5   # careful smoke test
+guvrun -m dumper.cli run --makes 74,183,121 --workers 8 --rate 18   # priority brands first
+```
+
+**Multi-terminal split (optional):** `--makes` lets you partition makes across
+separate processes, each independently resumable:
+
+```bash
+# Terminal 1: guvrun -m dumper.cli run --makes 74      --rate 6 --workers 3   # MERCEDES (51 models)
+# Terminal 2: guvrun -m dumper.cli run --makes 183,184 --rate 6 --workers 3   # HYUNDAI+KIA (56 models)
+# Terminal 3: guvrun -m dumper.cli run --makes 121,88  --rate 6 --workers 3   # VW+PEUGEOT (48 models)
+```
+
+Two rules: make lists must **not overlap**, and the rates must **sum ≤ 18** (the
+bucket is per-process; the plan's 20/s is shared by everything on the key). The
+single-process default is still preferred — one bucket wastes zero budget when a
+make finishes early.
+
+> **Quota reality:** these flags control *how fast and in what order* you spend
+> quota, not how much you have — at 18 req/s the month's 99,500 calls burn in
+> ~92 minutes, then the job auto-pauses until next month.
+
 ### Run as a server (control surface)
 
 ```bash

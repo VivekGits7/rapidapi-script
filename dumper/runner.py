@@ -1,13 +1,13 @@
 """dump_main() — top-level orchestrator for the RapidAPI Auto Parts dump.
 
-LINE APPROACH (make-major, depth-first):
-  Phase 1 (once):  reference data (languages, countries, vehicle types)
+PARALLEL LINE APPROACH (make-major, depth-first, N workers):
+  Phase 1 (once):  reference data (languages, countries, vehicle types, product names)
   Seed:            dump_targets.csv → rapid_api_dump_targets
-  Loop targets A→Z (make then model). For EACH target, to FULL depth before
-  the next:
+  DUMP_WORKERS concurrent workers each claim a target atomically (SKIP LOCKED)
+  and crawl it to FULL depth before claiming the next:
      seed make+mvt+model (no API) → vehicles → categories → articles
-     → enrich (specs + OEM) → media + S3 mirror (opt-in)
-     → mark target complete.
+     → details (specs + OEM + compat) → mark target complete.
+  ALL workers share ONE token bucket (DUMP_RATE_PER_SEC) — see OPTIMIZATION_PLAN.md.
 
 Resumability:
   - Resumes an in-flight/crashed job (status running/paused/failed).
@@ -16,20 +16,24 @@ Resumability:
 
 Graceful pause (exit 0):
   - AllKeysExhaustedError / MonthlyQuotaReachedError → mark job 'paused'.
-  - SIGINT / stop signal → checked between targets → 'paused'.
+  - SIGINT / stop signal → heartbeat task sets the stop event → workers finish
+    their current unit and exit → 'paused'.
 Other exceptions → mark job 'failed' + re-raise.
 """
 
+import asyncio
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Optional
 
 from config import settings
 from logger import get_logger
 from error import AllKeysExhaustedError, MonthlyQuotaReachedError, NoResumableJobError
 from dumper.id_utils import new_id
 from dumper.key_manager import api_key_manager
+from dumper.rate_limiter import configure_bucket
 from dumper.state import DumpPhase, DumpEntityState, DumpStage, StopRequested
-from dumper import targets
+from dumper import product_names, targets
+from dumper.http_client import close_http_client
 from dumper.phases import reference as phase_reference
 from dumper.phases.manufacturers import (
     fetch_models_meta,
@@ -58,8 +62,8 @@ StopCheck = Callable[[], Awaitable[bool]]
 
 # A 'running' job whose heartbeat (updated_at) is older than this had its worker
 # die (killed / crashed / reloaded) without marking it done. get_status treats it
-# as orphaned and auto-corrects to 'paused'. The runner heartbeats every stop-check
-# (before each vehicle + between leaf-category calls), well under this window.
+# as orphaned and auto-corrects to 'paused'. The heartbeat task bumps updated_at
+# every HEARTBEAT_INTERVAL_SEC (5s), well under this window.
 STALE_RUNNING_SECS = 120
 
 
@@ -100,18 +104,21 @@ async def _get_or_create_job(mode: str) -> str:
     return job_id
 
 
-async def _make_stop_check(job_id: str) -> StopCheck:
-    async def _check() -> bool:
-        # Doubles as a heartbeat: bumps updated_at so get_status can tell a live
-        # job from an orphaned 'running' row (dead worker). One round-trip, same
-        # cost as the old SELECT.
-        row = await execute_query_one(
-            "UPDATE rapid_api_dump_jobs SET updated_at = NOW() WHERE job_id = $1 RETURNING stop_requested",
-            job_id,
-        )
-        return bool(row and row["stop_requested"])
-
-    return _check
+async def _heartbeat_loop(job_id: str, stop_event: asyncio.Event) -> None:
+    """ONE task replaces the per-unit DB stop-checks: bumps the job heartbeat
+    (updated_at) and mirrors stop_requested into the in-memory event that every
+    worker reads for free between units."""
+    while True:
+        try:
+            row = await execute_query_one(
+                "UPDATE rapid_api_dump_jobs SET updated_at = NOW() WHERE job_id = $1 RETURNING stop_requested",
+                job_id,
+            )
+            if row and row["stop_requested"]:
+                stop_event.set()
+        except Exception as e:  # noqa: BLE001 — heartbeat must never kill the run
+            logger.warning(f"Heartbeat error: {e}")
+        await asyncio.sleep(settings.HEARTBEAT_INTERVAL_SEC)
 
 
 async def _set_phase(job_id: str, phase: str) -> None:
@@ -140,14 +147,34 @@ async def _mark(job_id: str, status: str, phase: str, error: str | None = None) 
 
 
 # ==================== TOP-LEVEL ORCHESTRATION ====================
-async def dump_main(mode: str = "run", manage_pool: bool = True, limit: int = 0) -> dict:
-    """limit > 0 processes at most that many targets this run (smoke test / batching)."""
+async def dump_main(
+    mode: str = "run",
+    manage_pool: bool = True,
+    limit: int = 0,
+    workers: Optional[int] = None,
+    rate: Optional[float] = None,
+    makes: Optional[list[int]] = None,
+) -> dict:
+    """Run the dump with N concurrent target-workers sharing one token bucket.
+
+    limit > 0   processes at most that many targets this run (smoke test / batching).
+    workers     overrides DUMP_WORKERS; rate overrides DUMP_RATE_PER_SEC (req/s).
+    makes       restricts claiming to these tec_manufacturer_ids (--makes).
+    """
     if manage_pool:
         await create_db_pool()
+    configure_bucket(rate)
     await api_key_manager.setup()
 
     job_id = await _get_or_create_job(mode)
-    check_stop = await _make_stop_check(job_id)
+    n_workers = max(1, workers or settings.DUMP_WORKERS)
+
+    stop_event = asyncio.Event()
+    hb_task = asyncio.create_task(_heartbeat_loop(job_id, stop_event))
+
+    async def check_stop() -> bool:
+        # In-memory event read — free; the heartbeat task does the DB work.
+        return stop_event.is_set()
 
     try:
         # ---- Phase 1: Reference (idempotent) ----
@@ -160,7 +187,7 @@ async def dump_main(mode: str = "run", manage_pool: bool = True, limit: int = 0)
         else:
             logger.info("Reference already done — skipping")
 
-        if await check_stop():
+        if stop_event.is_set():
             await _mark(job_id, "paused", DumpPhase.PAUSED.value, "stop requested after reference")
             return await _summary(job_id)
 
@@ -172,36 +199,74 @@ async def dump_main(mode: str = "run", manage_pool: bool = True, limit: int = 0)
         if not pc:
             raise RuntimeError("Passenger Car vehicle_type missing after reference phase")
 
-        # ---- Line loop: A→Z, one make/model to full depth ----
-        attempted_incomplete: list[str] = []
-        processed = 0
-        while True:
-            if limit and processed >= limit:
-                logger.info(f"Reached --limit {limit} targets this run")
-                await _mark(job_id, "paused", DumpPhase.PAUSED.value, f"limit {limit} reached")
-                return await _summary(job_id)
-            if await check_stop():
-                await _mark(job_id, "paused", DumpPhase.PAUSED.value, "stop requested")
-                return await _summary(job_id)
+        # productId → AR-name dictionary. fetch_and_store self-skips (1 cheap DB
+        # check) once AR names exist — needed here because resumed jobs skip the
+        # reference phase (reference_done=TRUE) where this normally runs.
+        await product_names.fetch_and_store()
+        await product_names.load_map()
 
-            target = await targets.next_target(exclude_ids=attempted_incomplete)
-            if not target:
-                break  # nothing left (all complete, or remainder deferred this run)
+        # ---- Worker pool: N workers, each claims a target → crawls to full depth ----
+        await _set_phase(job_id, DumpPhase.ARTICLES.value)
+        state: dict[str, Any] = {"processed": 0, "quota_exc": None}
+        attempted_incomplete: set = set()   # API-failed this run → deferred
+        in_flight: set = set()              # claimed right now → not claimable again
+        claim_lock = asyncio.Lock()
 
-            try:
-                completed = await _crawl_target(job_id, target, pc, check_stop)
-            except StopRequested:
-                # Stop honored mid-target — all crawled-so-far data is committed and
-                # the target stays 'resumable', so resume picks up where it left off.
+        async def worker(idx: int) -> None:
+            while True:
+                if stop_event.is_set():
+                    return
+                async with claim_lock:
+                    if limit and state["processed"] >= limit:
+                        return
+                    target = await targets.claim_next_target(
+                        exclude_ids=list(attempted_incomplete | in_flight), makes=makes
+                    )
+                    if not target:
+                        return  # nothing left to claim (for this run / make filter)
+                    in_flight.add(target["target_id"])
+                    state["processed"] += 1
+                label = f"{target['tec_manufacturer_name']} / {target['tec_model_name']}"
+                logger.info(f"[worker {idx}] → {label}")
+                try:
+                    completed = await _crawl_target(job_id, target, pc, check_stop)
+                    if not completed:
+                        attempted_incomplete.add(target["target_id"])
+                except StopRequested:
+                    return  # event already set; data committed, target resumable
+                except (AllKeysExhaustedError, MonthlyQuotaReachedError) as e:
+                    state["quota_exc"] = e
+                    stop_event.set()
+                    return
+                except Exception as e:  # noqa: BLE001 — one target never kills the pool
+                    logger.error(f"[worker {idx}] target {label} crashed: {e}", exc_info=True)
+                    await targets.record_target_error(target["target_id"], str(e))
+                    attempted_incomplete.add(target["target_id"])
+                finally:
+                    in_flight.discard(target["target_id"])
                 await _refresh_counts(job_id)
-                await _mark(job_id, "paused", DumpPhase.PAUSED.value, "stop requested (mid-target)")
-                logger.info(f"Stop honored mid-target — job {job_id} paused (resumable)")
-                return await _summary(job_id)
-            if not completed:
-                # API failure left it incomplete — defer for this run, retry next run.
-                attempted_incomplete.append(target["target_id"])
-            processed += 1
-            await _refresh_counts(job_id)
+
+        logger.info(f"Starting {n_workers} worker(s) @ {settings.effective_rate_per_sec if rate is None else rate} req/s"
+                    f"{f' | makes={makes}' if makes else ''}{f' | limit={limit}' if limit else ''}")
+        await asyncio.gather(*[worker(i + 1) for i in range(n_workers)])
+        await _refresh_counts(job_id)
+
+        # ---- Outcome ----
+        if state["quota_exc"] is not None:
+            e = state["quota_exc"]
+            logger.error(f"Quota pause: {e.detail}")
+            await _mark(job_id, "paused", DumpPhase.PAUSED.value, e.detail)
+            return await _summary(job_id)
+
+        if stop_event.is_set():
+            await _mark(job_id, "paused", DumpPhase.PAUSED.value, "stop requested")
+            logger.info(f"Stop honored — job {job_id} paused (resumable)")
+            return await _summary(job_id)
+
+        if limit and state["processed"] >= limit:
+            logger.info(f"Reached --limit {limit} targets this run")
+            await _mark(job_id, "paused", DumpPhase.PAUSED.value, f"limit {limit} reached")
+            return await _summary(job_id)
 
         # ---- Completion ----
         counts = await targets.target_counts()
@@ -217,6 +282,7 @@ async def dump_main(mode: str = "run", manage_pool: bool = True, limit: int = 0)
         return await _summary(job_id)
 
     except (AllKeysExhaustedError, MonthlyQuotaReachedError) as e:
+        # Quota hit OUTSIDE the worker pool (reference phase / product names).
         logger.error(f"Quota pause: {e.detail}")
         await _mark(job_id, "paused", DumpPhase.PAUSED.value, e.detail)
         return await _summary(job_id)
@@ -227,6 +293,12 @@ async def dump_main(mode: str = "run", manage_pool: bool = True, limit: int = 0)
         await _mark(job_id, "failed", DumpPhase.FAILED.value, str(e))
         raise
     finally:
+        hb_task.cancel()
+        try:
+            await api_key_manager.flush()
+        except Exception as e:  # noqa: BLE001 — flush is best-effort on the way out
+            logger.warning(f"Final key flush failed: {e}")
+        await close_http_client()
         if manage_pool:
             await close_db_pool()
 
@@ -468,6 +540,7 @@ async def reset_dump(manage_pool: bool = True) -> dict:
                 "rapid_api_article_compatible_cars",
                 "rapid_api_category_articles",
                 "rapid_api_articles",
+                "rapid_api_product_names",
                 "rapid_api_vehicle_categories",
                 "rapid_api_categories",
                 "rapid_api_vehicles",

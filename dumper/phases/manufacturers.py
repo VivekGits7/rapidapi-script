@@ -23,6 +23,8 @@ logger = get_logger("dumper.seed")
 
 # Model metadata (AR name + production years) per make — fetched once per make per run.
 _models_meta_cache: dict[tuple, dict] = {}
+# Brand image per make — fetched once per make per run (was once per TARGET: 508 calls where 91 suffice).
+_mfg_image_cache: dict[int, Optional[str]] = {}
 
 
 def _parse_date(value) -> Optional[_dt.date]:
@@ -97,10 +99,14 @@ async def get_pc_vehicle_type() -> Optional[dict]:
 
 async def fetch_manufacturer_image(mfg_external_id: int) -> Optional[str]:
     """Return the RapidAPI brand image URL (GET /manufacturers/find-by-id/{id} → `image`).
-    One call per make. Returns None on failure / no image."""
+    One call per make PER RUN (cached — a make's models all share the brand image).
+    Returns None on failure / no image."""
+    if mfg_external_id in _mfg_image_cache:
+        return _mfg_image_cache[mfg_external_id]
     path = f"/manufacturers/find-by-id/{mfg_external_id}"
     data = await api_get(path)
     img = data.get("image") if isinstance(data, dict) else None
+    _mfg_image_cache[mfg_external_id] = img or None
     return img or None
 
 
