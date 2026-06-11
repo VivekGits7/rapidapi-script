@@ -13,6 +13,17 @@ Arabic spec/name columns, then write:
   - rapid_api_article_specs        (criteria _en/_ar, matched by index)
   - rapid_api_article_oem_refs
   - rapid_api_article_compatible_cars (denormalized — spans non-target models)
+
+FALLBACK: complete-details is flaky (hangs → read timeout, or returns an all-null
+shell even for valid articles). When it comes back unusable we compose the article
+from the lighter, reliable endpoints instead (COMPLETE_DETAILS_MAX_RETRIES caps the
+retries first so we fall back fast):
+    GET /articles/details/article-id/{articleId}/lang-id/{langId}      → specs/OEM/EAN/name + articleNo + supplierId
+    GET /articles/get-compatible-cars-by-article-number/type-id/{typeId}
+        ?articleNo=&supplierId=&countryFilterId=&langId=               → compatible cars
+The compat endpoint is keyed by articleNo+supplierId (not articleId), which the
+individual-details response hands us. Image is skipped on the fallback path — the
+articles-list phase already stored it.
 """
 
 import asyncio
@@ -30,6 +41,9 @@ from services.db import bulk_insert, execute_command, execute_query_one
 logger = get_logger("dumper.details")
 
 _DETAILS_PATH = "/articles/article-complete-details/type-id/{type_id}"
+
+_FALLBACK_DETAILS_PATH = "/articles/details/article-id/{article_id}/lang-id/{lang_id}"
+_FALLBACK_COMPAT_PATH = "/articles/get-compatible-cars-by-article-number/type-id/{type_id}"
 
 
 async def complete_articles_for_model(model_id: str, check_stop=None) -> bool:
@@ -66,41 +80,148 @@ async def complete_articles_for_model(model_id: str, check_stop=None) -> bool:
 
 
 async def _complete_article(article_id: str, external_id: int) -> bool:
-    type_id = settings.DEFAULT_TYPE_ID
-    path = _DETAILS_PATH.format(type_id=type_id)
+    """Primary: complete-details (one aggregate call). If it hangs/returns empty, fall
+    back to the lighter individual-details + dedicated compat-cars endpoints."""
+    en_data, ar_data = await _fetch_complete_details(external_id)
+    art = en_data.get("article") if isinstance(en_data, dict) else None
+    ar_art = ar_data.get("article") if isinstance(ar_data, dict) else None
+
+    if _has_usable_details(art):
+        return await _persist_from_complete_details(article_id, external_id, art, ar_art)
+
+    # complete-details timed out or came back all-null → fall back to per-article endpoints.
+    logger.info(f"complete-details empty for article {external_id} — falling back to individual-details + compat-cars")
+    return await _complete_article_via_fallback(article_id, external_id)
+
+
+async def _fetch_complete_details(external_id: int):
+    """Call the aggregate complete-details endpoint (EN + AR) with the flaky-endpoint
+    retry cap, so we fall back fast instead of burning the global retry budget."""
+    path = _DETAILS_PATH.format(type_id=settings.DEFAULT_TYPE_ID)
+    retries = settings.COMPLETE_DETAILS_MAX_RETRIES
     en_params = {"articleId": external_id, "langId": settings.DEFAULT_LANG_ID,
                  "countryFilterId": settings.DEFAULT_COUNTRY_FILTER_ID}
     if settings.BILINGUAL:
         ar_params = {"articleId": external_id, "langId": settings.ARABIC_LANG_ID,
                      "countryFilterId": settings.DEFAULT_COUNTRY_FILTER_ID}
-        en_data, ar_data = await asyncio.gather(api_get(path, params=en_params), api_get(path, params=ar_params))
-    else:
-        en_data, ar_data = await api_get(path, params=en_params), None
+        return await asyncio.gather(
+            api_get(path, params=en_params, max_retries=retries),
+            api_get(path, params=ar_params, max_retries=retries),
+        )
+    return await api_get(path, params=en_params, max_retries=retries), None
 
-    if en_data is None:
-        return False
 
-    art = en_data.get("article") if isinstance(en_data, dict) else None
+def _has_usable_details(art: Any) -> bool:
+    """True if complete-details actually returned data (not a null/empty shell)."""
     if not isinstance(art, dict):
-        await log_unparsed(path, UnparsedEntity.ARTICLE, en_data, UnparsedReason.NON_LIST_RESPONSE,
-                           parent_ref={"article_id": article_id, "external_id": external_id})
-        # Mark complete so it isn't retried forever (no usable detail payload).
-        await _mark_article_complete(article_id, None, None, None)
-        return True
+        return False
+    return bool(art.get("allSpecifications") or art.get("oemNo") or art.get("compatibleCars"))
 
-    ar_art = ar_data.get("article") if isinstance(ar_data, dict) else None
+
+async def _persist_from_complete_details(article_id: str, external_id: int,
+                                         art: Any, ar_art: Any) -> bool:
+    """Write everything from the aggregate complete-details payload (specs, OEM, EAN,
+    image, compatible cars all in one response)."""
     product_name_ar = ar_art.get("articleProductName") if isinstance(ar_art, dict) else None
     ean = None
     ean_obj = art.get("eanNo")
     if isinstance(ean_obj, dict):
         ean = ean_obj.get("eanNumbers")
     image = art.get("s3image")
-
     await _mark_article_complete(article_id, product_name_ar, ean, image, raw=art)
 
-    # ---- specs (match EN/AR by index) — dedup by EN name (DO UPDATE can't hit a row twice), one batch ----
-    en_specs = art.get("allSpecifications") or []
-    ar_specs = (ar_art.get("allSpecifications") if isinstance(ar_art, dict) else None) or []
+    ar_specs = ar_art.get("allSpecifications") if isinstance(ar_art, dict) else None
+    n_specs = await _persist_specs(article_id, art.get("allSpecifications"), ar_specs)
+    n_oem = await _persist_oem(article_id, art.get("oemNo"))
+    ar_compat = ar_art.get("compatibleCars") if isinstance(ar_art, dict) else None
+    n_compat = await _persist_compat(article_id, art.get("compatibleCars"), ar_compat)
+
+    logger.info(f"  Article {external_id} complete (complete-details): {n_specs} specs, {n_oem} OEM, {n_compat} compat")
+    return True
+
+
+async def _complete_article_via_fallback(article_id: str, external_id: int) -> bool:
+    """Compose the article from lighter endpoints when complete-details is unusable.
+
+    individual-details → specs/OEM/EAN/name (+ articleNo + supplierId), then the
+    dedicated compat endpoint keyed by (articleNo + supplierId) → compatible cars.
+    Image is intentionally skipped here — the articles-list phase already stored it.
+    """
+    en_path = _FALLBACK_DETAILS_PATH.format(article_id=external_id, lang_id=settings.DEFAULT_LANG_ID)
+    if settings.BILINGUAL:
+        ar_path = _FALLBACK_DETAILS_PATH.format(article_id=external_id, lang_id=settings.ARABIC_LANG_ID)
+        en_data, ar_data = await asyncio.gather(api_get(en_path), api_get(ar_path))
+    else:
+        en_data, ar_data = await api_get(en_path), None
+
+    if en_data is None:
+        # Network failure on the fallback too — leave incomplete, retry next run.
+        return False
+
+    art = en_data.get("article") if isinstance(en_data, dict) else None
+    if not isinstance(art, dict):
+        await log_unparsed(en_path, UnparsedEntity.ARTICLE, en_data, UnparsedReason.NON_LIST_RESPONSE,
+                           parent_ref={"article_id": article_id, "external_id": external_id})
+        # No usable payload from either endpoint — mark complete so it isn't retried forever.
+        await _mark_article_complete(article_id, None, None, None)
+        return True
+
+    ar_art = ar_data.get("article") if isinstance(ar_data, dict) else None
+    product_name_ar = ar_art.get("articleProductName") if isinstance(ar_art, dict) else None
+    ean = None
+    ean_obj = en_data.get("articleEanNo")
+    if isinstance(ean_obj, dict):
+        ean = ean_obj.get("eanNumbers")
+    # image=None → COALESCE keeps the URL the articles-list phase already stored.
+    await _mark_article_complete(article_id, product_name_ar, ean, None, raw=en_data)
+
+    # Individual-details puts specs/OEM/EAN at the TOP LEVEL (not under "article").
+    ar_specs = ar_data.get("articleAllSpecifications") if isinstance(ar_data, dict) else None
+    n_specs = await _persist_specs(article_id, en_data.get("articleAllSpecifications"), ar_specs)
+    n_oem = await _persist_oem(article_id, en_data.get("articleOemNo"))
+    n_compat = await _persist_fallback_compat(article_id, art.get("articleNo"), art.get("supplierId"))
+
+    logger.info(f"  Article {external_id} complete (fallback): {n_specs} specs, {n_oem} OEM, {n_compat} compat")
+    return True
+
+
+async def _persist_fallback_compat(article_id: str, article_no: Optional[str],
+                                   supplier_id: Any) -> int:
+    """Fetch compatible cars from the dedicated endpoint (keyed by articleNo + supplierId,
+    since individual-details carries no fitment) and persist them. EN + AR for the
+    localized typeEngineName."""
+    if not article_no or supplier_id is None:
+        return 0
+    path = _FALLBACK_COMPAT_PATH.format(type_id=settings.DEFAULT_TYPE_ID)
+    en_params = {"articleNo": article_no, "supplierId": supplier_id,
+                 "countryFilterId": settings.DEFAULT_COUNTRY_FILTER_ID, "langId": settings.DEFAULT_LANG_ID}
+    if settings.BILINGUAL:
+        ar_params = {**en_params, "langId": settings.ARABIC_LANG_ID}
+        en_data, ar_data = await asyncio.gather(api_get(path, params=en_params), api_get(path, params=ar_params))
+    else:
+        en_data, ar_data = await api_get(path, params=en_params), None
+    return await _persist_compat(article_id, _extract_compat(en_data), _extract_compat(ar_data))
+
+
+def _extract_compat(resp: Any) -> list:
+    """Pull the compatibleCars list out of the by-article-number response shape:
+    {"articles": [{"compatibleCars": [...]}]}. Merges across all returned articles."""
+    if not isinstance(resp, dict):
+        return []
+    articles = resp.get("articles")
+    if not isinstance(articles, list):
+        return []
+    out: list = []
+    for a in articles:
+        if isinstance(a, dict) and isinstance(a.get("compatibleCars"), list):
+            out.extend(a["compatibleCars"])
+    return out
+
+
+async def _persist_specs(article_id: str, en_specs: Any, ar_specs: Any) -> int:
+    """Specs (EN/AR matched by index), dedup by EN name (DO UPDATE can't hit a row twice)."""
+    en_specs = en_specs or []
+    ar_specs = ar_specs or []
     spec_rows: list[tuple] = []
     spec_seen: set[str] = set()
     if isinstance(en_specs, list):
@@ -123,9 +244,12 @@ async def _complete_article(article_id: str, external_id: int) -> bool:
                criteria_value_en = EXCLUDED.criteria_value_en,
                criteria_value_ar = EXCLUDED.criteria_value_ar""",
     )
+    return len(spec_rows)
 
-    # ---- OEM (dedup, one batch) ----
-    oems = art.get("oemNo") or []
+
+async def _persist_oem(article_id: str, oems: Any) -> int:
+    """OEM cross-refs, dedup by (number, brand)."""
+    oems = oems or []
     oem_rows: list[tuple] = []
     oem_seen: set[tuple] = set()
     if isinstance(oems, list):
@@ -146,11 +270,13 @@ async def _complete_article(article_id: str, external_id: int) -> bool:
         oem_rows,
         "ON CONFLICT (article_id, oem_number, oem_brand) DO NOTHING",
     )
+    return len(oem_rows)
 
-    # ---- compatible cars (denormalized, dedup by vehicle, one batch) ----
-    # typeEngineName is localized → pull the AR name from the AR payload by vehicleId.
-    compat = art.get("compatibleCars") or []
-    ar_compat = ar_art.get("compatibleCars") if isinstance(ar_art, dict) else None
+
+async def _persist_compat(article_id: str, compat: Any, ar_compat: Any) -> int:
+    """Compatible cars (denormalized, dedup by vehicle). typeEngineName is localized →
+    pull the AR name from the AR payload by vehicleId. Same item shape for both the
+    aggregate and the by-article-number endpoints."""
     ar_engine_by_vid: dict[int, Any] = {}
     if isinstance(ar_compat, list):
         for c in ar_compat:
@@ -180,9 +306,7 @@ async def _complete_article(article_id: str, external_id: int) -> bool:
         compat_rows,
         "ON CONFLICT (article_id, vehicle_external_id) DO NOTHING",
     )
-
-    logger.info(f"  Article {external_id} complete: {len(spec_rows)} specs, {len(oem_rows)} OEM, {len(compat_rows)} compat")
-    return True
+    return len(compat_rows)
 
 
 async def _mark_article_complete(article_id: str, product_name_ar: Optional[str],

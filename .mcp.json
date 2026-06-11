@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "RapidAPI Hub - Auto Parts Catalog": {
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://mcp.rapidapi.com",
+        "--header",
+        "x-api-host: auto-parts-catalog.p.rapidapi.com",
+        "--header",
+        "x-api-key: 18877eb7d5mshfe24dd72df99b47p1096fbjsn33b9e96fa40d"
+      ]
+    }
+  }
+}

@@ -67,6 +67,10 @@ class Settings(BaseSettings):
         description="If all keys are cooling for longer than this (seconds), assume quota exhaustion and pause the job",
     )
     MAX_TRANSIENT_RETRIES: int = Field(default=3, description="Max retries per request on transient errors")
+    # The article-complete-details aggregate endpoint is flaky (hangs/returns empty) — retry it
+    # only this many times before falling back to the lighter per-article endpoints, so we don't
+    # burn ~30s/timeout × many retries per article.
+    COMPLETE_DETAILS_MAX_RETRIES: int = Field(default=1, description="Retries for the complete-details call before falling back to individual-details + compat-cars")
     BATCH_SIZE: int = Field(default=100, description="Article ids per batch for specs/OEM endpoints")
 
     # ==================== TARGET FILTER (dump_targets.csv) ====================
