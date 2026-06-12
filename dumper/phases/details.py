@@ -59,8 +59,31 @@ async def complete_articles_for_model(model_id: str, check_stop=None) -> bool:
     """
     cap = settings.MAX_ARTICLES_PER_CATEGORY
     fanout = max(1, settings.DETAILS_FANOUT)
+
+    # Fetch ALL pending top-rank articles for the model in ONE scan. No ORDER BY → the
+    # planner drives from the model's vehicles (~30ms) instead of the global article_id
+    # index. The old per-slot `ORDER BY … LIMIT` re-scanned deeper each refill → O(N²) →
+    # the query eventually blew past the 60s command_timeout. Articles only go
+    # incomplete→complete and none are added during this phase, so one fetch is complete;
+    # anything still incomplete after a failure is picked up on the next run.
+    pending = await execute_query(
+        """
+        SELECT DISTINCT a.article_id, a.articles_external_id
+        FROM rapid_api_category_articles ca
+        JOIN rapid_api_articles a ON a.article_id = ca.article_id
+        JOIN rapid_api_vehicles v ON v.vehicle_id = ca.vehicle_id
+        WHERE v.model_id = $1
+          AND ($2 = 0 OR ca.rank <= $2)
+          AND a.dump_state = $3
+        """,
+        model_id, cap, DumpEntityState.INCOMPLETE.value,
+    )
+    queue = [(r["article_id"], int(r["articles_external_id"])) for r in pending]
+    if not queue:
+        return True
+
+    qi = 0
     in_flight: dict[asyncio.Task, Any] = {}  # task → article_id
-    claimed: set = set()                     # article_ids currently in flight
     ok_all = True
     stopping = False
 
@@ -68,29 +91,13 @@ async def complete_articles_for_model(model_id: str, check_stop=None) -> bool:
         if not stopping and check_stop is not None and await check_stop():
             stopping = True
 
-        # Top up the window while healthy (failures/stop let it drain instead).
+        # Refill the window from the in-memory queue (failures/stop let it drain instead).
         if ok_all and not stopping:
-            need = fanout - len(in_flight)
-            if need > 0:
-                rows = await execute_query(
-                    """
-                    SELECT DISTINCT a.article_id, a.articles_external_id
-                    FROM rapid_api_category_articles ca
-                    JOIN rapid_api_articles a ON a.article_id = ca.article_id
-                    JOIN rapid_api_vehicles v ON v.vehicle_id = ca.vehicle_id
-                    WHERE v.model_id = $1
-                      AND ($2 = 0 OR ca.rank <= $2)
-                      AND a.dump_state = $3
-                      AND NOT (a.article_id = ANY($4::uuid[]))
-                    ORDER BY a.article_id
-                    LIMIT $5
-                    """,
-                    model_id, cap, DumpEntityState.INCOMPLETE.value, list(claimed), need,
-                )
-                for r in rows:
-                    task = asyncio.create_task(_complete_article(r["article_id"], int(r["articles_external_id"])))
-                    in_flight[task] = r["article_id"]
-                    claimed.add(r["article_id"])
+            while len(in_flight) < fanout and qi < len(queue):
+                aid, ext = queue[qi]
+                qi += 1
+                task = asyncio.create_task(_complete_article(aid, ext))
+                in_flight[task] = aid
 
         if not in_flight:
             if stopping:
@@ -100,7 +107,6 @@ async def complete_articles_for_model(model_id: str, check_stop=None) -> bool:
         done, _ = await asyncio.wait(set(in_flight), return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             article_id = in_flight.pop(task)
-            claimed.discard(article_id)
             exc = task.exception()
             if exc is not None:
                 # Quota/fatal errors: drain the window, then propagate to the worker.

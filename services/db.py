@@ -29,7 +29,10 @@ async def create_db_pool() -> None:
         database=settings.POSTGRES_DB_NAME,
         min_size=2,
         max_size=settings.POSTGRES_POOL_MAX,
-        command_timeout=60,
+        command_timeout=settings.POSTGRES_COMMAND_TIMEOUT,
+        # Detect half-open connections to a remote DB fast (NAT/VPN drops) so the
+        # pool recycles them instead of a query hanging until command_timeout.
+        server_settings={"tcp_keepalives_idle": "30", "tcp_keepalives_interval": "10", "tcp_keepalives_count": "3"},
     )
     logger.info(
         f"Postgres pool created: {settings.POSTGRES_DB_USER}@{settings.POSTGRES_DB_HOST}:{settings.POSTGRES_DB_PORT}/{settings.POSTGRES_DB_NAME}"

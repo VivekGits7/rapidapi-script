@@ -112,6 +112,7 @@ async def seed_targets_from_csv() -> dict:
 async def claim_next_target(
     exclude_ids: Optional[list] = None,
     makes: Optional[list[int]] = None,
+    models: Optional[list[int]] = None,
 ) -> Optional[asyncpg.Record]:
     """Atomically CLAIM the next not-complete target, A→Z by make then model.
 
@@ -119,8 +120,9 @@ async def claim_next_target(
     FOR UPDATE SKIP LOCKED, so concurrent workers (or separate --makes
     processes) can never grab the same target simultaneously. Prefers
     RESUMABLE (work already started) before PENDING. `exclude_ids` skips
-    targets already attempted or currently in flight this run; `makes`
-    restricts claiming to those tec_manufacturer_ids (--makes flag).
+    targets already attempted or currently in flight this run; `makes` /
+    `models` restrict claiming to those tec_manufacturer_ids / tec_model_ids
+    (--makes / --models flags).
     """
     return await execute_query_one(
         """
@@ -132,6 +134,7 @@ async def claim_next_target(
             WHERE status <> $1
               AND NOT (target_id = ANY($3::uuid[]))
               AND (cardinality($4::int[]) = 0 OR tec_manufacturer_id = ANY($4::int[]))
+              AND (cardinality($5::int[]) = 0 OR tec_model_id = ANY($5::int[]))
             ORDER BY (status = $2) DESC,
                      tec_manufacturer_name ASC, tec_model_name ASC
             FOR UPDATE SKIP LOCKED
@@ -145,6 +148,7 @@ async def claim_next_target(
         TargetStatus.RESUMABLE.value,
         exclude_ids or [],
         makes or [],
+        models or [],
     )
 
 

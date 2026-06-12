@@ -88,6 +88,7 @@ class Settings(BaseSettings):
     KEY_FLUSH_MAX_PENDING: int = Field(default=200, description="Force a counter flush after this many unflushed calls")
     HEARTBEAT_INTERVAL_SEC: float = Field(default=5.0, description="Job heartbeat + stop-flag poll cadence (seconds)")
     POSTGRES_POOL_MAX: int = Field(default=30, description="asyncpg pool max connections")
+    POSTGRES_COMMAND_TIMEOUT: float = Field(default=120.0, description="Per-query timeout (s) — generous for a remote DB link")
 
     # ==================== TARGET FILTER (dump_targets.csv) ====================
     DUMP_TARGETS_CSV: str = Field(default="dump_targets.csv", description="Path to the make/model target seed CSV")

@@ -22,6 +22,8 @@ Other exceptions → mark job 'failed' + re-raise.
 """
 
 import asyncio
+import os
+import signal
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
@@ -154,12 +156,16 @@ async def dump_main(
     workers: Optional[int] = None,
     rate: Optional[float] = None,
     makes: Optional[list[int]] = None,
+    models: Optional[list[int]] = None,
 ) -> dict:
     """Run the dump with N concurrent target-workers sharing one token bucket.
 
     limit > 0   processes at most that many targets this run (smoke test / batching).
     workers     overrides DUMP_WORKERS; rate overrides DUMP_RATE_PER_SEC (req/s).
     makes       restricts claiming to these tec_manufacturer_ids (--makes).
+    models      restricts claiming to these tec_model_ids (--models); validated
+                against the seeded CSV — every model must exist and belong to
+                the given makes (when --makes is also passed).
     """
     if manage_pool:
         await create_db_pool()
@@ -175,6 +181,30 @@ async def dump_main(
     async def check_stop() -> bool:
         # In-memory event read — free; the heartbeat task does the DB work.
         return stop_event.is_set()
+
+    # CLI runs (manage_pool=True) own the process: make Ctrl+C graceful — first
+    # press requests a stop (workers finish their current step, job pauses clean),
+    # second press force-quits. Never installed under FastAPI (uvicorn owns signals).
+    _signals_installed: list = []
+    if manage_pool:
+        loop = asyncio.get_running_loop()
+
+        def _on_signal() -> None:
+            if stop_event.is_set():
+                logger.warning("Second interrupt — force quitting")
+                for s in _signals_installed:
+                    loop.remove_signal_handler(s)
+                os.kill(os.getpid(), signal.SIGINT)
+                return
+            logger.info("Interrupt — finishing current step, then pausing (press Ctrl+C again to force-quit)")
+            stop_event.set()
+
+        for s in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(s, _on_signal)
+                _signals_installed.append(s)
+            except (NotImplementedError, RuntimeError):
+                pass  # e.g. Windows / nested loop — Ctrl+C falls back to hard cancel
 
     try:
         # ---- Phase 1: Reference (idempotent) ----
@@ -194,6 +224,34 @@ async def dump_main(
         # ---- Seed targets from CSV (idempotent) ----
         seed = await targets.seed_targets_from_csv()
         logger.info(f"Targets: {seed}")
+
+        # ---- Validate --models against the seeded CSV (and --makes when given) ----
+        if models:
+            rows = await execute_query(
+                """
+                SELECT tec_model_id, tec_model_name, tec_manufacturer_id, tec_manufacturer_name
+                FROM rapid_api_dump_targets WHERE tec_model_id = ANY($1::int[])
+                """,
+                models,
+            )
+            found = {int(r["tec_model_id"]) for r in rows}
+            unknown = [m for m in models if m not in found]
+            if unknown:
+                msg = f"--models ids not in dump_targets.csv: {unknown}"
+                logger.error(msg)
+                await _mark(job_id, "paused", DumpPhase.PAUSED.value, msg)
+                return await _summary(job_id)
+            if makes:
+                wrong = [
+                    f"{r['tec_model_id']} ({r['tec_model_name']}) belongs to make "
+                    f"{r['tec_manufacturer_id']} ({r['tec_manufacturer_name']})"
+                    for r in rows if int(r["tec_manufacturer_id"]) not in makes
+                ]
+                if wrong:
+                    msg = f"--models not under --makes {makes}: {'; '.join(wrong)}"
+                    logger.error(msg)
+                    await _mark(job_id, "paused", DumpPhase.PAUSED.value, msg)
+                    return await _summary(job_id)
 
         pc = await get_pc_vehicle_type()
         if not pc:
@@ -220,7 +278,7 @@ async def dump_main(
                     if limit and state["processed"] >= limit:
                         return
                     target = await targets.claim_next_target(
-                        exclude_ids=list(attempted_incomplete | in_flight), makes=makes
+                        exclude_ids=list(attempted_incomplete | in_flight), makes=makes, models=models
                     )
                     if not target:
                         return  # nothing left to claim (for this run / make filter)
@@ -286,6 +344,11 @@ async def dump_main(
         logger.error(f"Quota pause: {e.detail}")
         await _mark(job_id, "paused", DumpPhase.PAUSED.value, e.detail)
         return await _summary(job_id)
+    except asyncio.CancelledError:
+        # Hard cancellation (force-quit / loop teardown) — leave an honest status
+        # so the job row isn't stuck on 'running'.
+        await _mark(job_id, "paused", DumpPhase.PAUSED.value, "interrupted (hard cancel)")
+        raise
     except NoResumableJobError:
         raise
     except Exception as e:
@@ -294,6 +357,13 @@ async def dump_main(
         raise
     finally:
         hb_task.cancel()
+        if manage_pool and _signals_installed:
+            _loop = asyncio.get_running_loop()
+            for s in _signals_installed:
+                try:
+                    _loop.remove_signal_handler(s)
+                except (NotImplementedError, RuntimeError):
+                    pass
         try:
             await api_key_manager.flush()
         except Exception as e:  # noqa: BLE001 — flush is best-effort on the way out

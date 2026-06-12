@@ -27,14 +27,14 @@ def _print_json(data: dict | list) -> None:
     click.echo(json.dumps(data, indent=2, default=str))
 
 
-def _parse_makes(makes: Optional[str]) -> Optional[list[int]]:
-    """'5,16,21' → [5, 16, 21]; None/empty → None (all makes)."""
-    if not makes:
+def _parse_ids(value: Optional[str], flag: str) -> Optional[list[int]]:
+    """'5,16,21' → [5, 16, 21]; None/empty → None (no filter)."""
+    if not value:
         return None
     try:
-        ids = [int(tok.strip()) for tok in makes.split(",") if tok.strip()]
+        ids = [int(tok.strip()) for tok in value.split(",") if tok.strip()]
     except ValueError:
-        raise click.BadParameter(f"--makes must be comma-separated integers, got: {makes!r}")
+        raise click.BadParameter(f"{flag} must be comma-separated integers, got: {value!r}")
     return ids or None
 
 
@@ -43,6 +43,7 @@ _run_options = [
     click.option("--workers", type=int, default=None, help="Concurrent target workers (default: DUMP_WORKERS from .env)."),
     click.option("--rate", type=float, default=None, help="Global req/s across all workers (default: DUMP_RATE_PER_SEC; clamped to the plan's 20/s)."),
     click.option("--makes", type=str, default=None, help="Comma-separated tec_manufacturer_ids to crawl (e.g. 5,16,21). Omit = all."),
+    click.option("--models", type=str, default=None, help="Comma-separated tec_model_ids to crawl (e.g. 4635,10615). Validated against the CSV; combine with --makes for a safety check."),
 ]
 
 
@@ -59,17 +60,18 @@ def cli():
 
 @cli.command()
 @_with_run_options
-def run(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str]):
+def run(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str]):
     """Run the dump — creates a new job if none active; otherwise resumes."""
     from dumper.runner import dump_main
 
     try:
         result = asyncio.run(
-            dump_main(mode="run", limit=limit, workers=workers, rate=rate, makes=_parse_makes(makes))
+            dump_main(mode="run", limit=limit, workers=workers, rate=rate,
+                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"))
         )
         _print_json(result)
     except KeyboardInterrupt:
-        click.echo("\nInterrupted — use `cli stop` for a graceful shutdown next time", err=True)
+        click.echo("\nForce-quit — job left as-is; `run` resumes it", err=True)
         sys.exit(130)
     except Exception as e:
         click.echo(f"ERROR: {e}", err=True)
@@ -79,17 +81,18 @@ def run(limit: int, workers: Optional[int], rate: Optional[float], makes: Option
 
 @cli.command()
 @_with_run_options
-def resume(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str]):
+def resume(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str]):
     """Resume the latest paused/failed job. Errors if there's nothing to resume."""
     from dumper.runner import dump_main
 
     try:
         result = asyncio.run(
-            dump_main(mode="resume", limit=limit, workers=workers, rate=rate, makes=_parse_makes(makes))
+            dump_main(mode="resume", limit=limit, workers=workers, rate=rate,
+                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"))
         )
         _print_json(result)
     except KeyboardInterrupt:
-        click.echo("\nInterrupted — use `cli stop` for a graceful shutdown next time", err=True)
+        click.echo("\nForce-quit — job left as-is; `run` resumes it", err=True)
         sys.exit(130)
     except Exception as e:
         click.echo(f"ERROR: {e}", err=True)

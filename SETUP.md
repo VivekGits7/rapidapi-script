@@ -29,6 +29,7 @@ Defaults live in `.env` (`DUMP_WORKERS=8`, `DUMP_RATE_PER_SEC=18`) — plain `ru
 | `--workers 8` | models crawled at the same time |
 | `--rate 18` | total req/s, ALL workers combined (plan max 20) |
 | `--makes 5,16` | only these `tec_manufacturer_id`s |
+| `--models 4635,8603` | only these `tec_model_id`s (checked against the CSV; with `--makes` it verifies the models belong to those makes) |
 | `--limit 10` | stop after 10 targets, pause cleanly |
 
 ---
@@ -64,8 +65,9 @@ guvrun -m dumper.cli run --makes 16,21,36   --rate 6 --workers 3
 ## 4. Stop / resume (single terminal)
 
 ```bash
-guvrun -m dumper.cli stop      # graceful: pauses within ~5s, fully resumable
-Ctrl+C                         # also fine — nothing is lost
+guvrun -m dumper.cli stop      # graceful from another terminal — may take a minute mid-heavy-article
+Ctrl+C                         # graceful too: finishes current step, pauses clean
+Ctrl+C  Ctrl+C                 # second press = force quit (job auto-recovers on next run)
 guvrun -m dumper.cli run       # resume (picks up exactly where it stopped)
 guvrun -m dumper.cli resume    # same, but errors if there is nothing to resume
 ```
@@ -132,3 +134,17 @@ guvrun -m dumper.cli reset --yes-i-am-sure   # truncates ALL dump tables
 | Caps | `MAX_VEHICLES_PER_MODEL=5` · `MAX_ARTICLES_PER_CATEGORY=2` (raise later + re-run = fills the rest, no re-fetch) |
 
 Deep details: `README.md` · design rationale: `archive/OPTIMIZATION_PLAN.md`.
+
+
+
+
+
+
+
+# One at a time, full speed:
+guvrun -m dumper.cli run --makes 2 --models 4635  --rate 18 --workers 4   # 156 Sportwagon (490 pending)
+guvrun -m dumper.cli run --makes 2 --models 8603  --rate 18 --workers 4   # GIULIETTA (294 pending)
+guvrun -m dumper.cli run --makes 2 --models 36486 --rate 18 --workers 4   # GIULIA (428 pending)
+
+# Or all three in one go:
+guvrun -m dumper.cli run --makes 2 --models 4635,8603,36486 --rate 18 --workers 4

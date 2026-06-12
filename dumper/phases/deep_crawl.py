@@ -20,7 +20,7 @@ from config import settings
 from logger import get_logger
 from dumper.http_client import api_get
 from dumper.unparsed import UnparsedEntity, UnparsedReason, log_unparsed
-from services.db import bulk_insert, execute_command, execute_command_with_return
+from services.db import bulk_insert, execute_command, execute_query
 
 logger = get_logger("dumper.crawl")
 
@@ -186,20 +186,119 @@ async def fetch_categories_for_vehicle(vehicle: asyncpg.Record) -> None:
         cats = {}
 
     ar_names = _index_categories_ar(ar_data)
-    cache = _cat_id_cache  # module-level: vehicle #2..N reuse uuids resolved by #1
-    cat_ids: list[Any] = []
+
+    # Flatten the whole tree in memory (NO DB), then write it in a handful of batched
+    # statements — was one round-trip PER NODE (~665 × remote-RTT ≈ 9 min/vehicle).
+    nodes: list[dict] = []        # ordered, deduped by external id (parents before children)
+    seen_ext: set[int] = set()
+    bad_nodes: list[Any] = []     # nodes missing categoryId → logged after the walk
+
+    def _flatten(node, parent_ext, root_ext, ppath_en, ppath_ar, sort_order) -> None:
+        ext = _parse_int(node.get("categoryId"))
+        if ext is None:
+            bad_nodes.append(node)
+            return
+        name_en = node.get("categoryName", "") or ""
+        name_ar = ar_names.get(ext)
+        children = node.get("children")
+        is_leaf = not children or (isinstance(children, (list, dict)) and len(children) == 0)
+        level = _parse_int(node.get("level")) or 1
+        path_en = f"{ppath_en} > {name_en}" if ppath_en else name_en
+        path_ar = f"{ppath_ar} > {name_ar or name_en}" if ppath_ar else (name_ar or name_en)
+        r_ext = root_ext if root_ext is not None else ext
+        if ext not in seen_ext:
+            seen_ext.add(ext)
+            nodes.append({
+                "ext": ext, "parent_ext": parent_ext, "root_ext": r_ext,
+                "name_en": name_en, "name_ar": name_ar, "level": level,
+                "path_en": path_en, "path_ar": path_ar, "is_leaf": is_leaf, "sort": sort_order,
+            })
+        if isinstance(children, dict):
+            cs = 0
+            for child in children.values():
+                if isinstance(child, dict):
+                    _flatten(child, ext, r_ext, path_en, path_ar, cs)
+                    cs += 1
+
     sort = 0
     for root_name, root_node in cats.items():
         if not isinstance(root_node, dict):
             await log_unparsed(en_path, UnparsedEntity.CATEGORY, root_node, UnparsedReason.NON_DICT_ITEM,
                                parent_ref={**parent, "root_name": str(root_name)})
             continue
-        await _walk(root_node, None, None, vehicle_type_id, type_code, lang_id, vehicle_id,
-                    cache, ar_names, sort, "", "", en_path, cat_ids)
+        _flatten(root_node, None, None, "", "", sort)
         sort += 1
+    for bad in bad_nodes:
+        await log_unparsed(en_path, UnparsedEntity.CATEGORY, bad, UnparsedReason.MISSING_EXTERNAL_ID,
+                           parent_ref={"vehicle_id": vehicle_id})
 
-    # One batched insert for ALL (vehicle, category) links instead of one per node.
-    unique_ids = list(dict.fromkeys(cat_ids))  # dedup, keep order
+    if not nodes:
+        await execute_command(
+            "UPDATE rapid_api_vehicles SET categories_fetched_at = NOW() WHERE vehicle_id = $1", vehicle_id,
+        )
+        logger.info(f"  Categories for vehicle {vehicle_id}: 0 nodes")
+        return
+
+    all_ext = [n["ext"] for n in nodes]
+
+    # 1) Ensure every node EXISTS — scalars only, parent/root NULL so no row references
+    #    another at insert time (concurrency-safe: never an FK violation across workers).
+    ins_cols = ["category_id", "categories_external_id", "category_name_en", "category_name_ar",
+                "parent_category_id", "root_category_id", "level", "path_en", "path_ar",
+                "is_leaf", "sort_order", "vehicle_type_id", "lang_id"]
+    ins_rows = [
+        (str(uuid.uuid4()), n["ext"], n["name_en"], n["name_ar"], None, None,
+         n["level"], n["path_en"], n["path_ar"], n["is_leaf"], n["sort"], vehicle_type_id, lang_id)
+        for n in nodes
+    ]
+    await bulk_insert(
+        "rapid_api_categories", ins_cols, ins_rows,
+        # Loss-proof conflict handling: only ever FILL missing data, never wipe it.
+        #  - names/paths: keep existing unless empty (COALESCE/NULLIF) — fills a previously-missing AR name.
+        #  - is_leaf: sticky TRUE — if a category is a leaf in ANY vehicle's tree, we keep crawling its articles.
+        #  - parent/root: untouched here (set once in step 3, first-writer-wins).
+        """ON CONFLICT (categories_external_id, vehicle_type_id, lang_id) DO UPDATE SET
+               category_name_en = COALESCE(NULLIF(EXCLUDED.category_name_en, ''), rapid_api_categories.category_name_en),
+               category_name_ar = COALESCE(EXCLUDED.category_name_ar, rapid_api_categories.category_name_ar),
+               path_en = COALESCE(NULLIF(EXCLUDED.path_en, ''), rapid_api_categories.path_en),
+               path_ar = COALESCE(NULLIF(EXCLUDED.path_ar, ''), rapid_api_categories.path_ar),
+               is_leaf = rapid_api_categories.is_leaf OR EXCLUDED.is_leaf,
+               updated_at = NOW()""",
+    )
+
+    # 2) Authoritative external_id → uuid map (covers rows inserted by any worker).
+    rows = await execute_query(
+        """SELECT categories_external_id, category_id FROM rapid_api_categories
+           WHERE categories_external_id = ANY($1::int[]) AND vehicle_type_id = $2 AND lang_id = $3""",
+        all_ext, vehicle_type_id, lang_id,
+    )
+    ext_to_uuid = {int(r["categories_external_id"]): r["category_id"] for r in rows}
+    _cat_id_cache.update(ext_to_uuid)
+
+    # 3) Wire up parent/root refs in ONE statement (array params → no bind-param limit).
+    cids: list[Any] = []
+    parents: list[Any] = []
+    roots: list[Any] = []
+    for n in nodes:
+        cid = ext_to_uuid.get(n["ext"])
+        if cid is None:
+            continue
+        cids.append(cid)
+        parents.append(ext_to_uuid.get(n["parent_ext"]) if n["parent_ext"] is not None else None)
+        roots.append(ext_to_uuid.get(n["root_ext"]))
+    await execute_command(
+        # Only wire nodes not yet wired (root_category_id IS NULL) → first-writer-wins on
+        # tree structure, identical to the old per-node behavior. Freshly-inserted nodes
+        # (step 1 left parent/root NULL) get set; already-placed nodes are never moved.
+        """UPDATE rapid_api_categories c
+           SET parent_category_id = d.parent_id, root_category_id = d.root_id, updated_at = NOW()
+           FROM unnest($1::uuid[], $2::uuid[], $3::uuid[]) AS d(cid, parent_id, root_id)
+           WHERE c.category_id = d.cid AND c.root_category_id IS NULL""",
+        cids, parents, roots,
+    )
+
+    # 4) One batched insert for ALL (vehicle, category) links.
+    unique_ids = list(dict.fromkeys(cids))
     vca_rows = [(str(uuid.uuid4()), vehicle_id, cid) for cid in unique_ids]
     await bulk_insert(
         "rapid_api_vehicle_categories",
@@ -211,7 +310,7 @@ async def fetch_categories_for_vehicle(vehicle: asyncpg.Record) -> None:
     await execute_command(
         "UPDATE rapid_api_vehicles SET categories_fetched_at = NOW() WHERE vehicle_id = $1", vehicle_id,
     )
-    logger.info(f"  Categories for vehicle {vehicle_id}: {len(unique_ids)} links (1 batch, {len(cache)} cached nodes)")
+    logger.info(f"  Categories for vehicle {vehicle_id}: {len(nodes)} nodes, {len(unique_ids)} links (4 batches)")
 
 
 def _index_categories_ar(ar_data) -> dict:
@@ -229,57 +328,6 @@ def _index_categories_ar(ar_data) -> dict:
                         walk(ch)
         walk(cats)
     return names
-
-
-async def _walk(node, parent_cat_id, root_cat_id, vehicle_type_id, type_code, lang_id,
-                vehicle_id, cache, ar_names, sort_order, parent_path_en, parent_path_ar, api_path, cat_ids) -> None:
-    ext_cat_id = _parse_int(node.get("categoryId"))
-    name_en = node.get("categoryName", "") or ""
-    if ext_cat_id is None:
-        await log_unparsed(api_path, UnparsedEntity.CATEGORY, node, UnparsedReason.MISSING_EXTERNAL_ID,
-                           parent_ref={"vehicle_id": vehicle_id})
-        return
-    name_ar = ar_names.get(ext_cat_id)
-    children = node.get("children")
-    is_leaf = not children or (isinstance(children, (list, dict)) and len(children) == 0)
-    level = _parse_int(node.get("level")) or 1
-    path_en = f"{parent_path_en} > {name_en}" if parent_path_en else name_en
-    path_ar = f"{parent_path_ar} > {name_ar or name_en}" if parent_path_ar else (name_ar or name_en)
-
-    category_id = cache.get(ext_cat_id)
-    if not category_id:
-        # ONE round-trip: upsert + RETURNING gives the real id whether inserted or
-        # already present. (DO UPDATE keeps the existing root/parent on conflict.)
-        gen = str(uuid.uuid4())
-        actual_root = root_cat_id or gen  # root node → self-reference (gen becomes the inserted id)
-        row = await execute_command_with_return(
-            """
-            INSERT INTO rapid_api_categories
-              (category_id, categories_external_id, category_name_en, category_name_ar, parent_category_id,
-               root_category_id, level, path_en, path_ar, is_leaf, sort_order, vehicle_type_id, lang_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-            ON CONFLICT (categories_external_id, vehicle_type_id, lang_id) DO UPDATE SET updated_at = NOW()
-            RETURNING category_id
-            """,
-            gen, ext_cat_id, name_en, name_ar, parent_cat_id, actual_root,
-            level, path_en, path_ar, is_leaf, sort_order, vehicle_type_id, lang_id,
-        )
-        if not row:
-            logger.warning(f"Failed to upsert category {ext_cat_id} for vehicle {vehicle_id}")
-            return
-        category_id = row["category_id"]
-        cache[ext_cat_id] = category_id
-
-    cat_ids.append(category_id)  # vca links are batch-inserted by the caller
-
-    if isinstance(children, dict) and children:
-        child_sort = 0
-        for child in children.values():
-            if not isinstance(child, dict):
-                continue
-            await _walk(child, category_id, root_cat_id or category_id, vehicle_type_id, type_code,
-                        lang_id, vehicle_id, cache, ar_names, child_sort, path_en, path_ar, api_path, cat_ids)
-            child_sort += 1
 
 
 # ==================== HELPERS ====================

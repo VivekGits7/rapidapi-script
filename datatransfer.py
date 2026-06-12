@@ -72,7 +72,9 @@ TABLES: list[str] = [
 ]
 
 FALLBACK_PATTERN = "rapid_api_*"            # used only when TABLES is empty
-DEST_EXTENSIONS = ["pg_trgm", "pgcrypto"]   # created on dest before restore
+# Always created on dest; the source's installed extensions are ALSO synced
+# dynamically before restore (e.g. uuid-ossp for uuid_generate_v4 defaults).
+DEST_EXTENSIONS = ["pg_trgm", "pgcrypto"]
 
 
 # ==================== helpers ====================
@@ -239,10 +241,17 @@ def main() -> None:
         sys.exit(f"ERROR: these tables don't exist in SOURCE (or aren't readable): {', '.join(missing)}")
     print(f"Source rows: {sum(src_counts.values())} across {len(tables)} tables.\n")
 
-    # ensure required extensions on DEST (trigram GIN indexes need pg_trgm)
-    for ext in DEST_EXTENSIONS:
+    # ensure required extensions on DEST: the static list + everything installed
+    # on SOURCE (table defaults like uuid_generate_v4() need uuid-ossp, etc.)
+    src_exts = []
+    try:
+        names = _psql_scalar(psql, src, "SELECT string_agg(extname, ',') FROM pg_extension WHERE extname <> 'plpgsql';")
+        src_exts = [n for n in (names or "").split(",") if n]
+    except Exception as e:
+        print(f"  warn: could not list source extensions: {e}")
+    for ext in dict.fromkeys(DEST_EXTENSIONS + src_exts):  # dedup, keep order
         try:
-            _psql_scalar(psql, dst, f"CREATE EXTENSION IF NOT EXISTS {ext};")
+            _psql_scalar(psql, dst, f'CREATE EXTENSION IF NOT EXISTS "{ext}";')
         except Exception as e:
             print(f"  warn: could not create extension {ext} on dest: {e}")
 

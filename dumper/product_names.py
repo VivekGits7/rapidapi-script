@@ -88,21 +88,34 @@ async def fetch_and_store(force: bool = False) -> int:
 
 
 async def load_map(force: bool = False) -> None:
-    """Load the dictionary into memory (~11k rows). Called once per run before crawling."""
+    """Load the dictionary into memory (~11k rows). Called once per run before crawling.
+
+    Retries transient DB stalls (a remote-link blip on this one-time bulk read must
+    not crash the whole job) — the actual crawl tolerates this query being slow.
+    """
     global _map
     if _map is not None and not force:
         return
     async with _lock:
         if _map is not None and not force:
             return
-        rows = await execute_query(
-            "SELECT products_external_id, product_name_en, product_name_ar FROM rapid_api_product_names"
-        )
-        _map = {
-            int(r["products_external_id"]): {"en": r["product_name_en"], "ar": r["product_name_ar"]}
-            for r in rows
-        }
-        logger.info(f"Product names map loaded: {len(_map)} entries")
+        last_err: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                rows = await execute_query(
+                    "SELECT products_external_id, product_name_en, product_name_ar FROM rapid_api_product_names"
+                )
+                _map = {
+                    int(r["products_external_id"]): {"en": r["product_name_en"], "ar": r["product_name_ar"]}
+                    for r in rows
+                }
+                logger.info(f"Product names map loaded: {len(_map)} entries")
+                return
+            except Exception as e:  # noqa: BLE001 — retry transient stalls, re-raise if persistent
+                last_err = e
+                logger.warning(f"Product names load attempt {attempt}/3 failed: {e!r} — retrying")
+                await asyncio.sleep(3 * attempt)
+        raise last_err  # type: ignore[misc]
 
 
 def get_ar_name(product_id: Optional[int]) -> Optional[str]:
