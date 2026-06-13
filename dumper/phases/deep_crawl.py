@@ -1,8 +1,9 @@
 """Per-model vehicles + categories (bilingual, store-all).
 
   vehicles:   API list-vehicles-types in EN + AR (parallel). Store ALL vehicles
-              of the model, ranked latest-first by construction date (crawl_rank).
-              completed=FALSE for all; the runner crawls only the top N.
+              of the model (minus any excluded by the fuelType filter, e.g. diesel),
+              ranked latest-first by construction date (crawl_rank). completed=FALSE
+              for all; the runner crawls only the top N.
   categories: API products-groups-variant-2 in EN + AR (parallel). Store the full
               tree with category_name_en/_ar + path_en/_ar per vehicle crawled.
 
@@ -38,8 +39,9 @@ async def fetch_vehicles_for_model(
     api_type_id: int,
     type_code: str,
 ) -> None:
-    """Fetch ALL vehicles of the model (EN+AR), dedup, rank by latest construction
-    date, and store every one (completed=FALSE). Sets model.vehicles_fetched_at."""
+    """Fetch ALL vehicles of the model (EN+AR), dedup, drop fuelType-excluded variants
+    (e.g. diesel — see settings.fuel_exclude_prefixes), rank the kept ones by latest
+    construction date, and store every one (completed=FALSE). Sets vehicles_fetched_at."""
     en_path = (
         f"/types/type-id/{api_type_id}/list-vehicles-types/{api_model_id}"
         f"/lang-id/{settings.DEFAULT_LANG_ID}/country-filter-id/{settings.DEFAULT_COUNTRY_FILTER_ID}"
@@ -86,6 +88,26 @@ async def fetch_vehicles_for_model(
         seen.add(vid)
         items.append(it)
 
+    # Fuel-type filter (e.g. exclude diesel) — applied BEFORE ranking so crawl_rank and the
+    # top-N deep crawl operate on the KEPT set only (else the cap could be wasted on excluded
+    # variants). Checks EN + AR fuelType; kept rows are byte-for-byte identical to unfiltered.
+    exclude_prefixes = settings.fuel_exclude_prefixes
+    excluded_count = 0
+    if exclude_prefixes:
+        kept: list[dict] = []
+        for it in items:
+            ar = ar_by_id.get(int(it["vehicleId"]), {})
+            if _fuel_excluded(it.get("fuelType"), ar.get("fuelType"), exclude_prefixes):
+                excluded_count += 1
+            else:
+                kept.append(it)
+        if excluded_count:
+            logger.info(
+                f"  Fuel filter: excluded {excluded_count}/{len(items)} vehicles for model "
+                f"{model_id} (prefixes={exclude_prefixes})"
+            )
+        items = kept
+
     # Rank latest-first: still-in-production (null end) first, then newest end, then newest start.
     def _rank_key(it: dict):
         end = _parse_date(it.get("constructionIntervalEnd"))
@@ -123,8 +145,15 @@ async def fetch_vehicles_for_model(
         "ON CONFLICT (vehicles_external_id) DO NOTHING",
     )
 
-    await _mark_model_vehicles_done(model_id, "has_data" if items else "empty",
-                                    None if items else f"0 vehicles for model {api_model_id}")
+    if items:
+        await _mark_model_vehicles_done(model_id, "has_data", None)
+    elif excluded_count:
+        await _mark_model_vehicles_done(
+            model_id, "empty",
+            f"all {excluded_count} vehicles excluded by fuel filter for model {api_model_id}",
+        )
+    else:
+        await _mark_model_vehicles_done(model_id, "empty", f"0 vehicles for model {api_model_id}")
     logger.info(f"  Vehicles for model {model_id}: {inserted} stored in 1 batch (of {len(items)} distinct)")
 
 
@@ -146,6 +175,23 @@ _NOT_SUPPORTED = ("not supported yet",)
 
 def _is_not_supported(value) -> bool:
     return isinstance(value, str) and any(p in value.strip().lower().rstrip(".") for p in _NOT_SUPPORTED)
+
+
+def _fuel_excluded(en_fuel: Optional[str], ar_fuel: Optional[str], prefixes: list[str]) -> bool:
+    """True if this engine variant's fuel type should be dropped from the dump.
+
+    A variant is excluded when its (stripped, lowercased) EN *or* AR fuelType STARTS
+    WITH any configured prefix — e.g. prefix 'diesel' drops 'Diesel' and 'Diesel/Electric';
+    prefix 'ديزل' drops the Arabic equivalent. Petrol/Electric/LPG/hybrid-petrol are kept.
+    Empty prefix list = nothing excluded (store all fuels)."""
+    if not prefixes:
+        return False
+    for val in (en_fuel, ar_fuel):
+        if val:
+            norm = val.strip().lower()
+            if any(norm.startswith(p) for p in prefixes):
+                return True
+    return False
 
 
 async def _mark_model_vehicles_done(model_id: str, status: str, message: Optional[str]) -> None:

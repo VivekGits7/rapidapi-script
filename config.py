@@ -47,6 +47,17 @@ class Settings(BaseSettings):
     MAX_VEHICLES_PER_MODEL: int = Field(default=5, description="Latest N vehicles per model to fully crawl (0 = all)")
     MAX_ARTICLES_PER_CATEGORY: int = Field(default=2, description="Top N articles per (vehicle, category) to fetch full details for (0 = all)")
 
+    # ==================== FUEL-TYPE FILTER (exclude-by-prefix) ====================
+    # Drop vehicles (engine variants) whose fuelType STARTS WITH any of these prefixes,
+    # checked against BOTH the English (lang 4) and Arabic (lang 42) fuelType. The filter
+    # runs BEFORE ranking, so crawl_rank (and the top-N deep crawl) is computed over the
+    # KEPT set only. Comma-separated, case-insensitive. Empty = no filter (store all fuels).
+    # Default excludes diesel: "Diesel" and "Diesel/Electric" (EN) + "ديزل" (AR).
+    VEHICLE_FUEL_EXCLUDE_PREFIXES: str = Field(
+        default="diesel,ديزل",
+        description="fuelType prefixes to EXCLUDE from the dump (EN+AR, comma-separated, case-insensitive). Empty = keep all.",
+    )
+
     # ==================== DATABASE CONFIGURATION ====================
     POSTGRES_DB_HOST: str = Field(default="localhost", description="PostgreSQL host")
     POSTGRES_DB_PORT: int = Field(default=5432, description="PostgreSQL port")
@@ -176,6 +187,12 @@ class Settings(BaseSettings):
         # De-dup while preserving order
         seen: set[str] = set()
         return [k for k in ordered if not (k in seen or seen.add(k))]
+
+    @property
+    def fuel_exclude_prefixes(self) -> list[str]:
+        """Parsed, normalized (stripped + lowercased) fuelType exclude prefixes.
+        Empty list = filtering disabled (store every fuel type)."""
+        return [p.strip().lower() for p in self.VEHICLE_FUEL_EXCLUDE_PREFIXES.split(",") if p.strip()]
 
     @property
     def is_production(self) -> bool:
