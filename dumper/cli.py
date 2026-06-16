@@ -1,6 +1,7 @@
 """CLI entry point for the dumper.
 
 Usage:
+    guvrun -m dumper.cli import-targets            # ONE-TIME: load dump_targets.csv into the DB (source of truth)
     guvrun -m dumper.cli run                       # one-shot full dump (resumes if a job is in flight)
     guvrun -m dumper.cli run --workers 8 --rate 18 # parallel crawl at ~18 req/s (defaults from .env)
     guvrun -m dumper.cli run --makes 5,16,21       # only these tec_manufacturer_ids
@@ -41,9 +42,11 @@ def _parse_ids(value: Optional[str], flag: str) -> Optional[list[int]]:
 _run_options = [
     click.option("--limit", type=int, default=0, help="Process at most N targets this run (0 = all). Use --limit 1 for a smoke test."),
     click.option("--workers", type=int, default=None, help="Concurrent target workers (default: DUMP_WORKERS from .env)."),
-    click.option("--rate", type=float, default=None, help="Global req/s across all workers (default: DUMP_RATE_PER_SEC; clamped to the plan's 20/s)."),
+    click.option("--rate", type=float, default=None, help="Global req/s across all workers (default: DUMP_RATE_PER_SEC; clamped to the plan's 100/s)."),
     click.option("--makes", type=str, default=None, help="Comma-separated tec_manufacturer_ids to crawl (e.g. 5,16,21). Omit = all."),
     click.option("--models", type=str, default=None, help="Comma-separated tec_model_ids to crawl (e.g. 4635,10615). Validated against the CSV; combine with --makes for a safety check."),
+    click.option("--until", type=click.Choice(["manufacturers", "models", "vehicles", "categories", "articles", "details"]),
+                 default=None, help="breadth_first only: stop cleanly AFTER this phase (e.g. categories). Resume later to continue. Omit = all phases."),
 ]
 
 
@@ -60,14 +63,14 @@ def cli():
 
 @cli.command()
 @_with_run_options
-def run(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str]):
+def run(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str], until: Optional[str]):
     """Run the dump — creates a new job if none active; otherwise resumes."""
     from dumper.runner import dump_main
 
     try:
         result = asyncio.run(
             dump_main(mode="run", limit=limit, workers=workers, rate=rate,
-                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"))
+                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"), until=until)
         )
         _print_json(result)
     except KeyboardInterrupt:
@@ -81,14 +84,14 @@ def run(limit: int, workers: Optional[int], rate: Optional[float], makes: Option
 
 @cli.command()
 @_with_run_options
-def resume(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str]):
+def resume(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str], until: Optional[str]):
     """Resume the latest paused/failed job. Errors if there's nothing to resume."""
     from dumper.runner import dump_main
 
     try:
         result = asyncio.run(
             dump_main(mode="resume", limit=limit, workers=workers, rate=rate,
-                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"))
+                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"), until=until)
         )
         _print_json(result)
     except KeyboardInterrupt:
@@ -97,6 +100,32 @@ def resume(limit: int, workers: Optional[int], rate: Optional[float], makes: Opt
     except Exception as e:
         click.echo(f"ERROR: {e}", err=True)
         logger.error("CLI resume failed", exc_info=True)
+        sys.exit(1)
+
+
+@cli.command(name="import-targets")
+@click.option("--csv", "csv_path", type=str, default=None, help="Path to the targets CSV (default: DUMP_TARGETS_CSV from .env).")
+def import_targets(csv_path: Optional[str]):
+    """ONE-TIME import of dump_targets.csv into rapid_api_dump_targets.
+
+    The table is the source of truth after this — the dump no longer reads the CSV.
+    Idempotent: re-running refreshes names and ADDS new rows; existing statuses stay.
+    """
+    from dumper import targets
+    from services.db import close_db_pool, create_db_pool
+
+    async def _run() -> dict:
+        await create_db_pool()
+        try:
+            return await targets.import_targets_from_csv(csv_path)
+        finally:
+            await close_db_pool()
+
+    try:
+        _print_json(asyncio.run(_run()))
+    except Exception as e:
+        click.echo(f"ERROR: {e}", err=True)
+        logger.error("CLI import-targets failed", exc_info=True)
         sys.exit(1)
 
 

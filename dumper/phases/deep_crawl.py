@@ -39,9 +39,10 @@ async def fetch_vehicles_for_model(
     api_type_id: int,
     type_code: str,
 ) -> None:
-    """Fetch ALL vehicles of the model (EN+AR), dedup, drop fuelType-excluded variants
-    (e.g. diesel — see settings.fuel_exclude_prefixes), rank the kept ones by latest
-    construction date, and store every one (completed=FALSE). Sets vehicles_fetched_at."""
+    """Fetch ALL vehicles of the model (EN+AR), dedup, and store every one. fuelType-excluded
+    variants (e.g. diesel — see settings.fuel_exclude_prefixes) are stored too but flagged
+    is_fuel_excluded=TRUE with crawl_rank=NULL (skipped from the deep crawl); the kept ones are
+    ranked 1..N by latest construction date. Sets vehicles_fetched_at."""
     en_path = (
         f"/types/type-id/{api_type_id}/list-vehicles-types/{api_model_id}"
         f"/lang-id/{settings.DEFAULT_LANG_ID}/country-filter-id/{settings.DEFAULT_COUNTRY_FILTER_ID}"
@@ -88,27 +89,27 @@ async def fetch_vehicles_for_model(
         seen.add(vid)
         items.append(it)
 
-    # Fuel-type filter (e.g. exclude diesel) — applied BEFORE ranking so crawl_rank and the
-    # top-N deep crawl operate on the KEPT set only (else the cap could be wasted on excluded
-    # variants). Checks EN + AR fuelType; kept rows are byte-for-byte identical to unfiltered.
+    # Fuel-type filter (e.g. diesel): STORE-BUT-SKIP. Excluded variants are still saved
+    # (is_fuel_excluded=TRUE, crawl_rank=NULL) so they're listed in the DB, but the top-N
+    # deep crawl operates on the KEPT (non-excluded) set only — the cap is never wasted on
+    # them. Checks EN + AR fuelType. Flip is_fuel_excluded=FALSE later to deep-crawl one.
     exclude_prefixes = settings.fuel_exclude_prefixes
-    excluded_count = 0
-    if exclude_prefixes:
-        kept: list[dict] = []
-        for it in items:
-            ar = ar_by_id.get(int(it["vehicleId"]), {})
-            if _fuel_excluded(it.get("fuelType"), ar.get("fuelType"), exclude_prefixes):
-                excluded_count += 1
-            else:
-                kept.append(it)
-        if excluded_count:
-            logger.info(
-                f"  Fuel filter: excluded {excluded_count}/{len(items)} vehicles for model "
-                f"{model_id} (prefixes={exclude_prefixes})"
-            )
-        items = kept
+    kept: list[dict] = []
+    excluded: list[dict] = []
+    for it in items:
+        ar = ar_by_id.get(int(it["vehicleId"]), {})
+        if exclude_prefixes and _fuel_excluded(it.get("fuelType"), ar.get("fuelType"), exclude_prefixes):
+            excluded.append(it)
+        else:
+            kept.append(it)
+    if excluded:
+        logger.info(
+            f"  Fuel filter: {len(excluded)}/{len(items)} vehicles stored-but-skipped for model "
+            f"{model_id} (prefixes={exclude_prefixes})"
+        )
 
-    # Rank latest-first: still-in-production (null end) first, then newest end, then newest start.
+    # Rank the KEPT set latest-first: still-in-production (null end) first, then newest end,
+    # then newest start. Excluded variants keep crawl_rank=NULL.
     def _rank_key(it: dict):
         end = _parse_date(it.get("constructionIntervalEnd"))
         start = _parse_date(it.get("constructionIntervalStart"))
@@ -117,44 +118,55 @@ async def fetch_vehicles_for_model(
             -(end.toordinal()) if end else 0,     # newest end first
             -(start.toordinal()) if start else 0, # newest start first
         )
-    items.sort(key=_rank_key)
+    kept.sort(key=_rank_key)
 
-    # Build all rows, then ONE batched upsert (ON CONFLICT dedups — no per-row SELECT).
-    rows: list[tuple] = []
-    for rank, it in enumerate(items, start=1):
-        vid = int(it["vehicleId"])
-        ar = ar_by_id.get(vid, {})
-        rows.append((
-            str(uuid.uuid4()), vid, model_id, vehicle_type_id, settings.DEFAULT_LANG_ID, settings.DEFAULT_COUNTRY_FILTER_ID,
-            it.get("manufacturerName"), it.get("modelName"),
-            it.get("typeEngineName"), ar.get("typeEngineName"),
-            _parse_date(it.get("constructionIntervalStart")), _parse_date(it.get("constructionIntervalEnd")),
-            _parse_decimal(it.get("powerKw")), _parse_decimal(it.get("powerPs")), it.get("capacityTax"),
-            it.get("fuelType"), ar.get("fuelType"), it.get("bodyType"), ar.get("bodyType"),
-            _parse_int(it.get("numberOfCylinders")), _parse_decimal(it.get("capacityLt")),
-            _parse_decimal(it.get("capacityTech")), it.get("engineCodes"), _parse_int(it.get("engId")), rank,
-        ))
+    # Build all rows (kept ranked 1..N + excluded flagged), then ONE batched upsert.
+    rows: list[tuple] = [
+        _build_vehicle_row(it, ar_by_id, model_id, vehicle_type_id, rank, False)
+        for rank, it in enumerate(kept, start=1)
+    ] + [
+        _build_vehicle_row(it, ar_by_id, model_id, vehicle_type_id, None, True)
+        for it in excluded
+    ]
     inserted = await bulk_insert(
         "rapid_api_vehicles",
         ["vehicle_id", "vehicles_external_id", "model_id", "vehicle_type_id", "lang_id", "country_filter_id",
          "manufacturer_name", "model_name", "type_engine_name_en", "type_engine_name_ar",
          "construction_start", "construction_end", "power_kw", "power_ps", "capacity_tax",
          "fuel_type_en", "fuel_type_ar", "body_type_en", "body_type_ar", "number_of_cylinders",
-         "capacity_lt", "capacity_tech", "engine_codes", "eng_id", "crawl_rank"],
+         "capacity_lt", "capacity_tech", "engine_codes", "eng_id", "crawl_rank", "is_fuel_excluded"],
         rows,
         "ON CONFLICT (vehicles_external_id) DO NOTHING",
     )
 
     if items:
-        await _mark_model_vehicles_done(model_id, "has_data", None)
-    elif excluded_count:
-        await _mark_model_vehicles_done(
-            model_id, "empty",
-            f"all {excluded_count} vehicles excluded by fuel filter for model {api_model_id}",
-        )
+        msg = None if kept else f"all {len(excluded)} vehicles fuel-excluded for model {api_model_id}"
+        await _mark_model_vehicles_done(model_id, "has_data", msg)
     else:
         await _mark_model_vehicles_done(model_id, "empty", f"0 vehicles for model {api_model_id}")
-    logger.info(f"  Vehicles for model {model_id}: {inserted} stored in 1 batch (of {len(items)} distinct)")
+    logger.info(
+        f"  Vehicles for model {model_id}: {inserted} stored in 1 batch "
+        f"({len(kept)} crawlable + {len(excluded)} skipped, of {len(items)} distinct)"
+    )
+
+
+def _build_vehicle_row(it: dict, ar_by_id: dict, model_id: str, vehicle_type_id: str,
+                       crawl_rank: Optional[int], is_fuel_excluded: bool) -> tuple:
+    """One rapid_api_vehicles row tuple. crawl_rank is NULL + is_fuel_excluded=TRUE for
+    fuel-skipped variants (stored/listed but not deep-crawled)."""
+    vid = int(it["vehicleId"])
+    ar = ar_by_id.get(vid, {})
+    return (
+        str(uuid.uuid4()), vid, model_id, vehicle_type_id, settings.DEFAULT_LANG_ID, settings.DEFAULT_COUNTRY_FILTER_ID,
+        it.get("manufacturerName"), it.get("modelName"),
+        it.get("typeEngineName"), ar.get("typeEngineName"),
+        _parse_date(it.get("constructionIntervalStart")), _parse_date(it.get("constructionIntervalEnd")),
+        _parse_decimal(it.get("powerKw")), _parse_decimal(it.get("powerPs")), it.get("capacityTax"),
+        it.get("fuelType"), ar.get("fuelType"), it.get("bodyType"), ar.get("bodyType"),
+        _parse_int(it.get("numberOfCylinders")), _parse_decimal(it.get("capacityLt")),
+        _parse_decimal(it.get("capacityTech")), it.get("engineCodes"), _parse_int(it.get("engId")),
+        crawl_rank, is_fuel_excluded,
+    )
 
 
 def _index_vehicles_ar(ar_data) -> dict:

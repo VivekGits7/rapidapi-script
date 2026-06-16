@@ -10,13 +10,16 @@ category, and product pages.
 
 ## What it dumps — store-all, complete top-N
 
-The **only filter is make + model** (`dump_targets.csv`, 647 rows · 91 makes ·
-508 models), processed **A→Z by make then model** (one make finishes before the
-next). Everything under a targeted model follows **store-all, complete the top-N**:
+The **only filter is make + model**, held in the **`rapid_api_dump_targets` table**
+(the source of truth — one row per make/model with a `status`). It's populated once
+from `dump_targets.csv` (647 rows · 91 makes · 508 models) via `import-targets`;
+after that you add/edit/remove targets directly in Postgres. Targets are processed
+**A→Z by make then model** (one make finishes before the next). Everything under a
+targeted model follows **store-all, complete the top-N**:
 
 | Layer | Rule |
 |---|---|
-| **Vehicles** | store **ALL** engine variants (ranked latest-first by construction date); fully crawl only the top **`MAX_VEHICLES_PER_MODEL` (=5)** |
+| **Vehicles** | store **ALL** engine variants (ranked latest-first by construction date); fully crawl the top **`MAX_VEHICLES_PER_MODEL`** (`=0` → **all** non-diesel variants). Fuel-excluded variants (diesel) are **stored + flagged** (`is_fuel_excluded`) but skipped from the deep crawl |
 | **Categories** | **ALL** leaf categories of each crawled vehicle (every car part) |
 | **Articles** | store **ALL** articles per category (with `rank`); fetch full details only for the top **`MAX_ARTICLES_PER_CATEGORY` (=5)** |
 | **Details** | `article-complete-details` (one call) → specs + OEM + EAN + image + **all compatible vehicles** |
@@ -44,7 +47,9 @@ API endpoints + verified request/response JSON: see **`API_DUMP_REFERENCE.md`**.
    - `RAPIDAPI_RATE_LIMIT_PER_SEC=20`, `MONTHLY_REQUEST_HARD_LIMIT=100000`
    - `POSTGRES_DB_*` — database connection
    - `DEFAULT_LANG_ID=4`, `ARABIC_LANG_ID=42`, `DEFAULT_COUNTRY_FILTER_ID=80`, `BILINGUAL=true`
-   - `MAX_VEHICLES_PER_MODEL=5`, `MAX_ARTICLES_PER_CATEGORY=5`
+   - `MAX_VEHICLES_PER_MODEL=0` (0 = crawl ALL non-diesel vehicles), `MAX_ARTICLES_PER_CATEGORY=2`
+   - `CRAWL_MODE=depth_first` (one manufacturer fully, then next) or `breadth_first` (all manufacturers → models → vehicles → categories → articles → details). Switch + resume anytime.
+   - `VEHICLE_FUEL_EXCLUDE_PREFIXES=diesel,ديزل` — fuel types stored-but-skipped from the deep crawl (both modes); empty = deep-crawl all fuels
    - S3 (for the image mirror, optional): `S3_ENABLED`, `AWS_*`, `S3_ARTICLE_MEDIA_FOLDER`
 3. Create the schema (**destructive — DROP + rebuild of all `rapid_api_*` tables**):
    ```bash
@@ -60,8 +65,9 @@ API endpoints + verified request/response JSON: see **`API_DUMP_REFERENCE.md`**.
 ## Run it — CLI
 
 ```bash
+guvrun -m dumper.cli import-targets  # ONE-TIME: load dump_targets.csv → DB (the source of truth)
 guvrun -m dumper.cli run --limit 1   # SMOKE TEST: dump only the first target (1 make/model)
-guvrun -m dumper.cli run             # dump everything (resumes; pauses at 99,500 calls/month)
+guvrun -m dumper.cli run             # dump everything (resumes; pauses at 999,500 calls/month)
 guvrun -m dumper.cli resume          # explicitly resume a paused/failed job
 guvrun -m dumper.cli status          # latest job state + counts
 guvrun -m dumper.cli counts          # API usage, monthly ceiling, target progress
@@ -78,13 +84,13 @@ guvrun -m dumper.cli reset --yes-i-am-sure   # DANGER: truncate all dump tables
 > Design rationale + the full optimization story: **`archive/OPTIMIZATION_PLAN.md`**.
 
 ```bash
-guvrun -m dumper.cli run --workers 8 --rate 18 --makes 5,16,21 --limit 10
+guvrun -m dumper.cli run --workers 8 --rate 90 --makes 5,16,21 --limit 10
 ```
 
 | Flag | Meaning |
 |---|---|
 | `--workers 8` | How many **targets (models) are crawled simultaneously** inside one process. Each worker atomically claims a target (`FOR UPDATE SKIP LOCKED` — two workers can never grab the same model), crawls it to full depth, then claims the next. |
-| `--rate 18` | **Global speed limit (req/s)** — a token bucket shared by ALL workers combined. Plan allows 20/s; 18 leaves margin so a 429 never cooldown-stalls the single key. |
+| `--rate 90` | **Global speed limit (req/s)** — a token bucket shared by ALL workers combined. Plan allows 100/s; 90 leaves margin so a 429 never cooldown-stalls the single key. |
 | `--makes 5,16,21` | Only claim targets of these `tec_manufacturer_id`s (5 = AUDI, 16 = BMW, 21 = CITROËN). Omit = all 508 targets, A→Z. |
 | `--limit 10` | Stop after N targets **total across all workers**, then pause cleanly. |
 
@@ -99,28 +105,28 @@ so plain `guvrun -m dumper.cli run` does the right thing with zero flags.
 **Common recipes:**
 
 ```bash
-guvrun -m dumper.cli run --workers 8 --rate 18            # full speed, everything
+guvrun -m dumper.cli run --workers 8 --rate 90            # full speed, everything
 guvrun -m dumper.cli run --limit 1 --workers 2 --rate 5   # careful smoke test
-guvrun -m dumper.cli run --makes 74,183,121 --workers 8 --rate 18   # priority brands first
+guvrun -m dumper.cli run --makes 74,183,121 --workers 8 --rate 90   # priority brands first
 ```
 
 **Multi-terminal split (optional):** `--makes` lets you partition makes across
 separate processes, each independently resumable:
 
 ```bash
-# Terminal 1: guvrun -m dumper.cli run --makes 74      --rate 6 --workers 3   # MERCEDES (51 models)
-# Terminal 2: guvrun -m dumper.cli run --makes 183,184 --rate 6 --workers 3   # HYUNDAI+KIA (56 models)
-# Terminal 3: guvrun -m dumper.cli run --makes 121,88  --rate 6 --workers 3   # VW+PEUGEOT (48 models)
+# Terminal 1: guvrun -m dumper.cli run --makes 74      --rate 30 --workers 3
+# Terminal 2: guvrun -m dumper.cli run --makes 183,184 --rate 30 --workers 3
+# Terminal 3: guvrun -m dumper.cli run --makes 121,88  --rate 30 --workers 3
 ```
 
-Two rules: make lists must **not overlap**, and the rates must **sum ≤ 18** (the
-bucket is per-process; the plan's 20/s is shared by everything on the key). The
+Two rules: make lists must **not overlap**, and the rates must **sum ≤ 90** (the
+bucket is per-process; the plan's 100/s is shared by everything on the key). The
 single-process default is still preferred — one bucket wastes zero budget when a
 make finishes early.
 
 > **Quota reality:** these flags control *how fast and in what order* you spend
-> quota, not how much you have — at 18 req/s the month's 99,500 calls burn in
-> ~92 minutes, then the job auto-pauses until next month.
+> quota, not how much you have — at 90 req/s the month's 999,500 calls burn in
+> ~3 hours, then the job auto-pauses until next month.
 
 ### Run as a server (control surface)
 
@@ -156,8 +162,7 @@ Returns `202` immediately; poll `GET /api/dump/status`.
 ## Images → S3 (separate, run individually)
 
 The dump captures the RapidAPI image URL inline (`api_image_url`) — **no extra
-calls**. Mirroring those images to our S3 is a **standalone** step (zero RapidAPI
-quota), run on its own:
+calls**. Mirroring those images to our S3 is a **standalone** step (zero RapidAPI quota), run on its own:
 
 ```bash
 guvrun media_rapid_to_s3.py            # mirror all pending images → s3_image_url
@@ -189,7 +194,7 @@ scripts/
 ├── dumper/
 │   ├── cli.py               # CLI entry (run/resume/status/counts/stop/reset)
 │   ├── runner.py            # orchestrator (line approach + completed model)
-│   ├── targets.py           # dump_targets.csv → table, A→Z iterator
+│   ├── targets.py           # one-time CSV import + claim/status (DB is source of truth)
 │   ├── http_client.py       # rate-limited GET/POST + key cooldowns
 │   ├── key_manager.py       # key rotation + monthly-usage guard
 │   └── phases/

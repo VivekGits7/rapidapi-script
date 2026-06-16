@@ -11,6 +11,13 @@ class StopRequested(Exception):
     """
 
 
+class CrawlMode(str, Enum):
+    """How the dump traverses the catalog tree (settings.CRAWL_MODE)."""
+
+    DEPTH_FIRST = "depth_first"      # one manufacturer fully crawled, then the next
+    BREADTH_FIRST = "breadth_first"  # finish each level across ALL targets before going deeper
+
+
 class DumpStatus(str, Enum):
     IDLE = "idle"
     RUNNING = "running"

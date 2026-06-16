@@ -1,13 +1,16 @@
 """dump_main() — top-level orchestrator for the RapidAPI Auto Parts dump.
 
-PARALLEL LINE APPROACH (make-major, depth-first, N workers):
-  Phase 1 (once):  reference data (languages, countries, vehicle types, product names)
-  Seed:            dump_targets.csv → rapid_api_dump_targets
-  DUMP_WORKERS concurrent workers each claim a target atomically (SKIP LOCKED)
-  and crawl it to FULL depth before claiming the next:
-     seed make+mvt+model (no API) → vehicles → categories → articles
-     → details (specs + OEM + compat) → mark target complete.
-  ALL workers share ONE token bucket (DUMP_RATE_PER_SEC) — see OPTIMIZATION_PLAN.md.
+Targets come from the rapid_api_dump_targets table (source of truth; imported once from
+dump_targets.csv via `dumper.cli import-targets`). Two traversal modes (settings.CRAWL_MODE):
+
+DEPTH_FIRST (make-major, N workers): each worker claims a target atomically (SKIP LOCKED)
+  and crawls it to FULL depth before the next:
+     seed make+mvt+model (no API) → vehicles → categories → articles → details → complete.
+BREADTH_FIRST (level-by-level): finish each phase across ALL in-scope targets before going
+  deeper — manufacturers → models → vehicles → categories → articles → details. `--until`
+  stops cleanly after a chosen phase.
+  Phase 1 (once): reference data (languages, countries, vehicle types, product names).
+  ALL workers/sweeps share ONE token bucket (DUMP_RATE_PER_SEC) — see OPTIMIZATION_PLAN.md.
 
 Resumability:
   - Resumes an in-flight/crashed job (status running/paused/failed).
@@ -157,6 +160,7 @@ async def dump_main(
     rate: Optional[float] = None,
     makes: Optional[list[int]] = None,
     models: Optional[list[int]] = None,
+    until: Optional[str] = None,
 ) -> dict:
     """Run the dump with N concurrent target-workers sharing one token bucket.
 
@@ -164,8 +168,10 @@ async def dump_main(
     workers     overrides DUMP_WORKERS; rate overrides DUMP_RATE_PER_SEC (req/s).
     makes       restricts claiming to these tec_manufacturer_ids (--makes).
     models      restricts claiming to these tec_model_ids (--models); validated
-                against the seeded CSV — every model must exist and belong to
-                the given makes (when --makes is also passed).
+                against rapid_api_dump_targets — every model must exist and belong
+                to the given makes (when --makes is also passed).
+    until       breadth_first only: stop cleanly after this phase (manufacturers |
+                models | vehicles | categories | articles | details). Resume continues.
     """
     if manage_pool:
         await create_db_pool()
@@ -221,11 +227,18 @@ async def dump_main(
             await _mark(job_id, "paused", DumpPhase.PAUSED.value, "stop requested after reference")
             return await _summary(job_id)
 
-        # ---- Seed targets from CSV (idempotent) ----
-        seed = await targets.seed_targets_from_csv()
-        logger.info(f"Targets: {seed}")
+        # ---- Targets come from the DB (source of truth) — no CSV seed on run ----
+        # The table is populated once via `dumper.cli import-targets`. If it's empty
+        # there's nothing to crawl, so pause cleanly with a clear instruction.
+        tgt_counts = await targets.target_counts()
+        logger.info(f"Targets: {tgt_counts}")
+        if tgt_counts.get("total", 0) == 0:
+            msg = "No targets in rapid_api_dump_targets — run `guvrun -m dumper.cli import-targets` first."
+            logger.error(msg)
+            await _mark(job_id, "paused", DumpPhase.PAUSED.value, msg)
+            return await _summary(job_id)
 
-        # ---- Validate --models against the seeded CSV (and --makes when given) ----
+        # ---- Validate --models against rapid_api_dump_targets (and --makes when given) ----
         if models:
             rows = await execute_query(
                 """
@@ -237,7 +250,7 @@ async def dump_main(
             found = {int(r["tec_model_id"]) for r in rows}
             unknown = [m for m in models if m not in found]
             if unknown:
-                msg = f"--models ids not in dump_targets.csv: {unknown}"
+                msg = f"--models ids not in rapid_api_dump_targets: {unknown}"
                 logger.error(msg)
                 await _mark(job_id, "paused", DumpPhase.PAUSED.value, msg)
                 return await _summary(job_id)
@@ -263,50 +276,24 @@ async def dump_main(
         await product_names.fetch_and_store()
         await product_names.load_map()
 
-        # ---- Worker pool: N workers, each claims a target → crawls to full depth ----
+        # ---- Crawl: depth-first (per-manufacturer) or breadth-first (level-by-level) ----
         await _set_phase(job_id, DumpPhase.ARTICLES.value)
-        state: dict[str, Any] = {"processed": 0, "quota_exc": None}
-        attempted_incomplete: set = set()   # API-failed this run → deferred
-        in_flight: set = set()              # claimed right now → not claimable again
-        claim_lock = asyncio.Lock()
+        # attempted_incomplete: targets API-failed/partial this run → deferred (gates completion).
+        state: dict[str, Any] = {"processed": 0, "quota_exc": None, "attempted_incomplete": set()}
 
-        async def worker(idx: int) -> None:
-            while True:
-                if stop_event.is_set():
-                    return
-                async with claim_lock:
-                    if limit and state["processed"] >= limit:
-                        return
-                    target = await targets.claim_next_target(
-                        exclude_ids=list(attempted_incomplete | in_flight), makes=makes, models=models
-                    )
-                    if not target:
-                        return  # nothing left to claim (for this run / make filter)
-                    in_flight.add(target["target_id"])
-                    state["processed"] += 1
-                label = f"{target['tec_manufacturer_name']} / {target['tec_model_name']}"
-                logger.info(f"[worker {idx}] → {label}")
-                try:
-                    completed = await _crawl_target(job_id, target, pc, check_stop)
-                    if not completed:
-                        attempted_incomplete.add(target["target_id"])
-                except StopRequested:
-                    return  # event already set; data committed, target resumable
-                except (AllKeysExhaustedError, MonthlyQuotaReachedError) as e:
-                    state["quota_exc"] = e
-                    stop_event.set()
-                    return
-                except Exception as e:  # noqa: BLE001 — one target never kills the pool
-                    logger.error(f"[worker {idx}] target {label} crashed: {e}", exc_info=True)
-                    await targets.record_target_error(target["target_id"], str(e))
-                    attempted_incomplete.add(target["target_id"])
-                finally:
-                    in_flight.discard(target["target_id"])
-                await _refresh_counts(job_id)
+        if settings.is_breadth_first:
+            logger.info(f"CRAWL_MODE=breadth_first — level-by-level sweep across all targets"
+                        f"{f' | makes={makes}' if makes else ''}{f' | models={models}' if models else ''}"
+                        f"{f' | limit={limit}' if limit else ''}{f' | until={until}' if until else ''}")
+            await _run_breadth_first(job_id, pc, n_workers, limit, makes, models, check_stop, stop_event, state, until)
+        else:
+            if until:
+                logger.warning(f"--until {until} is ignored in depth_first mode (per-target full crawl); set CRAWL_MODE=breadth_first to use it")
+            logger.info(f"CRAWL_MODE=depth_first — {n_workers} worker(s) @ "
+                        f"{settings.effective_rate_per_sec if rate is None else rate} req/s"
+                        f"{f' | makes={makes}' if makes else ''}{f' | limit={limit}' if limit else ''}")
+            await _run_depth_first(job_id, pc, n_workers, limit, makes, models, check_stop, stop_event, state)
 
-        logger.info(f"Starting {n_workers} worker(s) @ {settings.effective_rate_per_sec if rate is None else rate} req/s"
-                    f"{f' | makes={makes}' if makes else ''}{f' | limit={limit}' if limit else ''}")
-        await asyncio.gather(*[worker(i + 1) for i in range(n_workers)])
         await _refresh_counts(job_id)
 
         # ---- Outcome ----
@@ -327,11 +314,16 @@ async def dump_main(
             return await _summary(job_id)
 
         # ---- Completion ----
+        attempted_incomplete = state["attempted_incomplete"]
         counts = await targets.target_counts()
         if counts.get("pending", 0) == 0 and counts.get("resumable", 0) == 0 and not attempted_incomplete:
             await _set_done_flags(job_id)
             await _mark(job_id, "completed", DumpPhase.COMPLETED.value)
             logger.info(f"Dump job {job_id} COMPLETED — {counts['complete']} targets done")
+        elif state.get("until_stopped"):
+            await _mark(job_id, "paused", DumpPhase.PAUSED.value,
+                        f"stopped after --until '{state['until_stopped']}'; {counts}")
+            logger.info(f"Dump job {job_id} paused after --until '{state['until_stopped']}' — targets: {counts}")
         else:
             await _mark(job_id, "paused", DumpPhase.PAUSED.value,
                         f"deferred {len(attempted_incomplete)} target(s); {counts}")
@@ -371,6 +363,276 @@ async def dump_main(
         await close_http_client()
         if manage_pool:
             await close_db_pool()
+
+
+# ==================== CRAWL ORCHESTRATORS (depth-first / breadth-first) ====================
+async def _run_depth_first(job_id: str, pc: dict, n_workers: int, limit: int,
+                           makes: Optional[list[int]], models: Optional[list[int]],
+                           check_stop: StopCheck, stop_event: asyncio.Event, state: dict) -> None:
+    """Depth-first: N workers each atomically claim a target (make+model) and crawl it to
+    full depth before claiming the next. Make-major A→Z via the claim ordering."""
+    attempted_incomplete: set = state["attempted_incomplete"]
+    in_flight: set = set()              # claimed right now → not claimable again
+    claim_lock = asyncio.Lock()
+
+    async def worker(idx: int) -> None:
+        while True:
+            if stop_event.is_set():
+                return
+            async with claim_lock:
+                if limit and state["processed"] >= limit:
+                    return
+                target = await targets.claim_next_target(
+                    exclude_ids=list(attempted_incomplete | in_flight), makes=makes, models=models
+                )
+                if not target:
+                    return  # nothing left to claim (for this run / make filter)
+                in_flight.add(target["target_id"])
+                state["processed"] += 1
+            label = f"{target['tec_manufacturer_name']} / {target['tec_model_name']}"
+            logger.info(f"[worker {idx}] → {label}")
+            try:
+                completed = await _crawl_target(job_id, target, pc, check_stop)
+                if not completed:
+                    attempted_incomplete.add(target["target_id"])
+            except StopRequested:
+                return  # event already set; data committed, target resumable
+            except (AllKeysExhaustedError, MonthlyQuotaReachedError) as e:
+                state["quota_exc"] = e
+                stop_event.set()
+                return
+            except Exception as e:  # noqa: BLE001 — one target never kills the pool
+                logger.error(f"[worker {idx}] target {label} crashed: {e}", exc_info=True)
+                await targets.record_target_error(target["target_id"], str(e))
+                attempted_incomplete.add(target["target_id"])
+            finally:
+                in_flight.discard(target["target_id"])
+            await _refresh_counts(job_id)
+
+    await asyncio.gather(*[worker(i + 1) for i in range(n_workers)])
+
+
+_BREADTH_PHASES = ["manufacturers", "models", "vehicles", "categories", "articles", "details"]
+
+
+async def _run_breadth_first(job_id: str, pc: dict, n_workers: int, limit: int,
+                             makes: Optional[list[int]], models: Optional[list[int]],
+                             check_stop: StopCheck, stop_event: asyncio.Event, state: dict,
+                             until: Optional[str] = None) -> None:
+    """Breadth-first: finish each LEVEL across ALL in-scope targets before going deeper —
+    manufacturers → models → vehicles → categories → articles → details. Reuses every phase
+    function; resumability rides the existing per-entity cursors. Each level fans out across
+    its work-list with <= n_workers concurrency, sharing the one global rate bucket.
+
+    `until` (optional) stops the run cleanly AFTER that phase — e.g. until='categories' runs
+    manufacturers→models→vehicles→categories then pauses (targets stay resumable). A later
+    run continues from the next phase via the per-entity cursors. No-op finalize when stopped
+    early, so nothing is marked complete prematurely.
+    """
+    scope = await targets.scope_targets(makes=makes, models=models, limit=limit)
+    if not scope:
+        logger.info("Breadth-first: no in-scope targets to crawl")
+        return
+    state["processed"] = len(scope)
+    veh_cap = settings.MAX_VEHICLES_PER_MODEL
+    art_cap = settings.MAX_ARTICLES_PER_CATEGORY
+
+    stop_after = (until or "details").strip().lower()
+    if stop_after not in _BREADTH_PHASES:
+        stop_after = "details"
+
+    def _stop_here(phase: str) -> bool:
+        """True once we've finished the phase the caller asked to stop after."""
+        if phase == stop_after:
+            logger.info(f"Breadth: reached --until '{phase}' — pausing here (resume to continue deeper)")
+            state["until_stopped"] = phase
+            return True
+        return False
+
+    async def _sweep(label: str, items: list, coro) -> bool:
+        """Run coro(item) over items with bounded concurrency. Honors stop + quota.
+        Returns False (abort the run) on stop/quota; per-item errors are logged, not fatal."""
+        if not items:
+            logger.info(f"Breadth [{label}]: nothing to do")
+            return True
+        logger.info(f"Breadth [{label}]: {len(items)} item(s)")
+        await _set_phase(job_id, f"breadth:{label}")
+        sem = asyncio.Semaphore(max(1, n_workers))
+        abort = {"flag": False}
+
+        async def one(item) -> None:
+            if stop_event.is_set() or abort["flag"]:
+                return
+            async with sem:
+                if stop_event.is_set() or abort["flag"]:
+                    return
+                try:
+                    await coro(item)
+                except (AllKeysExhaustedError, MonthlyQuotaReachedError) as e:
+                    state["quota_exc"] = e
+                    abort["flag"] = True
+                    stop_event.set()
+                except StopRequested:
+                    abort["flag"] = True
+                    stop_event.set()
+                except Exception as e:  # noqa: BLE001 — one item never kills the sweep
+                    logger.error(f"Breadth [{label}] item failed: {e}", exc_info=True)
+
+        await asyncio.gather(*[one(it) for it in items])
+        await _refresh_counts(job_id)
+        return not (abort["flag"] or stop_event.is_set())
+
+    # B1 — Manufacturers (distinct makes in scope): brand image + upsert + PC junction.
+    seen_makes: dict[int, Any] = {}
+    for t in scope:
+        seen_makes.setdefault(int(t["tec_manufacturer_id"]), t)
+
+    async def _do_manufacturer(t) -> None:
+        image = None
+        try:
+            image = await fetch_manufacturer_image(int(t["tec_manufacturer_id"]))
+        except Exception as e:  # noqa: BLE001 — best-effort brand image
+            logger.warning(f"Manufacturer image fetch failed for {t['tec_manufacturer_id']}: {e}")
+        mfg_id = await upsert_manufacturer(t["tec_manufacturer_id"], t["tec_manufacturer_name"], image)
+        if mfg_id:
+            await upsert_mvt(mfg_id, pc["vehicle_type_id"], pc["type_code"])
+
+    if not await _sweep("manufacturers", list(seen_makes.values()), _do_manufacturer):
+        return
+    if _stop_here("manufacturers"):
+        return
+
+    # B2 — Models (all targets): AR name + production years + image, then mark target resumable.
+    async def _do_model(t) -> None:
+        mfg = await execute_query_one(
+            "SELECT manufacturer_id FROM rapid_api_manufacturers WHERE manufacturers_external_id = $1",
+            int(t["tec_manufacturer_id"]),
+        )
+        if not mfg:
+            await targets.record_target_error(t["target_id"], "manufacturer missing in breadth models phase")
+            return
+        model_name_ar = year_from = year_to = model_image = None
+        try:
+            meta = await fetch_models_meta(
+                int(pc["api_type_id"]), int(t["tec_manufacturer_id"]), settings.DEFAULT_COUNTRY_FILTER_ID
+            )
+            m = meta.get(int(t["tec_model_id"]))
+            if m:
+                if settings.BILINGUAL:
+                    model_name_ar = m.get("name_ar")
+                year_from = m.get("year_from")
+                year_to = m.get("year_to")
+            model_image = await fetch_model_image(int(pc["api_type_id"]), int(t["tec_model_id"]))
+        except Exception as e:  # noqa: BLE001 — best-effort meta/image
+            logger.warning(f"Model meta/image fetch failed for model {t['tec_model_id']}: {e}")
+        await upsert_model(
+            t["tec_model_id"], t["tec_model_name"], mfg["manufacturer_id"], pc["vehicle_type_id"],
+            model_name_ar, year_from=year_from, year_to=year_to, model_image_api_url=model_image,
+        )
+        await targets.mark_resumable(t["target_id"])
+
+    if not await _sweep("models", scope, _do_model):
+        return
+    if _stop_here("models"):
+        return
+
+    # Resolve each in-scope (make, model) to its model_id UUID now that B2 seeded the rows.
+    resolved = await execute_query(
+        """
+        SELECT s.make_ext, s.model_ext, m.model_id
+        FROM unnest($1::int[], $2::int[]) AS s(make_ext, model_ext)
+        JOIN rapid_api_manufacturers mf ON mf.manufacturers_external_id = s.make_ext
+        JOIN rapid_api_models m ON m.models_external_id = s.model_ext AND m.manufacturer_id = mf.manufacturer_id
+        """,
+        [int(t["tec_manufacturer_id"]) for t in scope],
+        [int(t["tec_model_id"]) for t in scope],
+    )
+    model_id_by_pair = {(int(r["make_ext"]), int(r["model_ext"])): r["model_id"] for r in resolved}
+    scope_models = [(t, model_id_by_pair.get((int(t["tec_manufacturer_id"]), int(t["tec_model_id"])))) for t in scope]
+    scope_model_uuids = [mid for _t, mid in scope_models if mid is not None]
+    if not scope_model_uuids:
+        logger.info("Breadth: no model rows resolved after seeding — nothing deeper to crawl")
+        return
+
+    # B3 — Vehicles: each in-scope model missing vehicles → store ALL (diesel stored+flagged).
+    models_for_vehicles = await execute_query(
+        """
+        SELECT model_id, models_external_id, vehicle_type_id
+        FROM rapid_api_models
+        WHERE model_id = ANY($1::uuid[]) AND vehicles_fetched_at IS NULL
+        """,
+        scope_model_uuids,
+    )
+
+    async def _do_vehicles(m) -> None:
+        await fetch_vehicles_for_model(
+            m["model_id"], int(m["models_external_id"]), m["vehicle_type_id"],
+            int(pc["api_type_id"]), pc["type_code"],
+        )
+
+    if not await _sweep("vehicles", models_for_vehicles, _do_vehicles):
+        return
+    if _stop_here("vehicles"):
+        return
+
+    # B4 — Categories: top-N non-diesel vehicles missing their category tree.
+    vehicles_for_cats = await execute_query(
+        """
+        SELECT v.vehicle_id, v.vehicles_external_id AS api_vehicle_id,
+               v.vehicle_type_id, vt.vehicle_types_external_id AS api_type_id,
+               vt.type_code, v.categories_fetched_at
+        FROM rapid_api_vehicles v
+        JOIN rapid_api_vehicle_types vt ON vt.vehicle_type_id = v.vehicle_type_id
+        WHERE v.model_id = ANY($1::uuid[]) AND v.is_fuel_excluded = FALSE
+          AND ($2 = 0 OR v.crawl_rank <= $2) AND v.categories_fetched_at IS NULL
+        """,
+        scope_model_uuids, veh_cap,
+    )
+    if not await _sweep("categories", vehicles_for_cats, fetch_categories_for_vehicle):
+        return
+    if _stop_here("categories"):
+        return
+
+    # B5 — Articles: top-N non-diesel vehicles with categories in but not yet complete.
+    vehicles_for_articles = await execute_query(
+        """
+        SELECT v.vehicle_id
+        FROM rapid_api_vehicles v
+        WHERE v.model_id = ANY($1::uuid[]) AND v.is_fuel_excluded = FALSE
+          AND ($2 = 0 OR v.crawl_rank <= $2)
+          AND v.categories_fetched_at IS NOT NULL AND v.dump_state = $3
+        """,
+        scope_model_uuids, veh_cap, DumpEntityState.INCOMPLETE.value,
+    )
+
+    async def _do_articles(v) -> None:
+        if await crawl_articles_for_vehicle(v["vehicle_id"], check_stop):
+            await _mark_vehicle_complete(v["vehicle_id"])
+
+    if not await _sweep("articles", vehicles_for_articles, _do_articles):
+        return
+    if _stop_here("articles"):
+        return
+
+    # B6 — Details: complete-details for the top-rank articles of every in-scope model.
+    models_for_details = await execute_query(
+        "SELECT model_id FROM rapid_api_models WHERE model_id = ANY($1::uuid[])",
+        scope_model_uuids,
+    )
+
+    async def _do_details(m) -> None:
+        await complete_articles_for_model(m["model_id"], check_stop)
+
+    if not await _sweep("details", models_for_details, _do_details):
+        return
+
+    # Finalize — mark each in-scope target complete once its (make-aware) model is fully done.
+    for t, model_uuid in scope_models:
+        if model_uuid and await _model_fully_done(model_uuid, veh_cap, art_cap):
+            await targets.mark_complete(t["target_id"])
+        else:
+            state["attempted_incomplete"].add(t["target_id"])
+    await _refresh_counts(job_id)
 
 
 async def _crawl_target(job_id: str, target: Any, pc: dict, check_stop: StopCheck) -> bool:
@@ -444,7 +706,8 @@ async def _crawl_target(job_id: str, target: Any, pc: dict, check_stop: StopChec
                        vt.type_code, v.categories_fetched_at
                 FROM rapid_api_vehicles v
                 JOIN rapid_api_vehicle_types vt ON vt.vehicle_type_id = v.vehicle_type_id
-                WHERE v.model_id = $1 AND v.dump_state = $2 AND ($3 = 0 OR v.crawl_rank <= $3)
+                WHERE v.model_id = $1 AND v.dump_state = $2 AND v.is_fuel_excluded = FALSE
+                  AND ($3 = 0 OR v.crawl_rank <= $3)
                 ORDER BY v.crawl_rank
                 LIMIT 1
                 """,
@@ -503,7 +766,7 @@ async def _model_fully_done(model_id: str, veh_cap: int, art_cap: int) -> bool:
         SELECT
           (SELECT vehicles_fetched_at IS NOT NULL FROM rapid_api_models WHERE model_id = $1) AS veh,
           NOT EXISTS (SELECT 1 FROM rapid_api_vehicles
-                      WHERE model_id = $1 AND dump_state = 'incomplete'
+                      WHERE model_id = $1 AND dump_state = 'incomplete' AND is_fuel_excluded = FALSE
                         AND ($2 = 0 OR crawl_rank <= $2)) AS vehicles_done,
           NOT EXISTS (SELECT 1 FROM rapid_api_category_articles ca
                       JOIN rapid_api_articles a ON a.article_id = ca.article_id

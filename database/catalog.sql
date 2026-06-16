@@ -143,7 +143,8 @@ CREATE TABLE rapid_api_vehicles (
     capacity_tech         NUMERIC(10, 4),                -- API: capacityTech
     engine_codes          VARCHAR(255),                  -- API: engineCodes
     eng_id                INT,                           -- API: engId
-    crawl_rank            INT,                           -- 1 = newest (by construction date); top MAX_VEHICLES_PER_MODEL get crawled
+    crawl_rank            INT,                           -- 1 = newest (by construction date); top MAX_VEHICLES_PER_MODEL get crawled. NULL for fuel-excluded (diesel)
+    is_fuel_excluded      BOOLEAN      NOT NULL DEFAULT FALSE,  -- TRUE = stored/listed but skipped from the deep crawl (categories/articles/details), e.g. diesel
     dump_state            rapid_api_dump_state NOT NULL DEFAULT 'incomplete',  -- complete = categories+articles+details done
     dump_stage            rapid_api_dump_stage NOT NULL DEFAULT 'listed',      -- listed→categories→articles→details
     categories_fetched_at TIMESTAMPTZ,                   -- DFS cursor
@@ -432,28 +433,24 @@ CREATE TABLE rapid_api_api_key_state (
 CREATE INDEX idx_rapid_api_api_key_state_cooldown ON rapid_api_api_key_state(cooldown_until);
 
 -- ==========================================================================
--- DUMP TARGETS (the make/model filter — seeded from dump_targets.csv)
+-- DUMP TARGETS (the make/model filter — THE source of truth for what we crawl)
 -- One row per (make, model) we intend to dump. status drives the line crawl.
--- CSV is the human-editable seed; THIS table is the live resumable state.
+-- dump_targets.csv is a ONE-TIME import (`dumper.cli import-targets`); after that
+-- this table is authoritative — add/edit/remove targets directly in Postgres.
 -- ==========================================================================
 CREATE TABLE rapid_api_dump_targets (
     target_id              UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     tec_manufacturer_id    INT          NOT NULL,        -- TecDoc make external id
     tec_manufacturer_name  VARCHAR(255),
-    cc_brand_slug          VARCHAR(255),
-    cc_brand_display       VARCHAR(255),
-    cc_model_slug          VARCHAR(255),
-    cc_model_display       VARCHAR(255),
     tec_model_id           INT          NOT NULL,        -- TecDoc model external id
     tec_model_name         VARCHAR(500),
-    notes                  TEXT,
     status                 VARCHAR(20)  NOT NULL DEFAULT 'pending',  -- pending | resumable | complete
     started_at             TIMESTAMPTZ,
     completed_at           TIMESTAMPTZ,
     last_error             TEXT,
     created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    UNIQUE (tec_manufacturer_id, tec_model_id),          -- re-seed is idempotent
+    UNIQUE (tec_manufacturer_id, tec_model_id),          -- re-import is idempotent
     CONSTRAINT rapid_api_dump_targets_status_check CHECK (status IN ('pending','resumable','complete'))
 );
 CREATE INDEX idx_rapid_api_dump_targets_status  ON rapid_api_dump_targets(status);

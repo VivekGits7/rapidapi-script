@@ -20,8 +20,9 @@ Make → Model → Vehicle (engine variant) → Category (part group) → Articl
 ```
 
 The golden rule of the whole script: **store everything we see, but only spend expensive
-API calls deep-crawling the most relevant slice** (the latest 5 engine variants of each
-model, and the top 2 parts in each category). Everything else is saved as a lightweight
+API calls deep-crawling the slice we configure** — the top `MAX_VEHICLES_PER_MODEL` engine
+variants per model (`0` = all non-diesel, the current setting) and the top
+`MAX_ARTICLES_PER_CATEGORY` parts per category. Everything else is saved as a lightweight
 record that can be "filled in later" just by raising a limit — no re-crawl needed.
 
 ---
@@ -45,7 +46,7 @@ dictionary we fetch once up front (see §4, Phase 0).
 
 **Auth:** every request carries our RapidAPI key in the `x-rapidapi-key` header against
 host `auto-parts-catalog.p.rapidapi.com`. The script rotates through multiple keys and
-respects the plan limits (≈20 requests/sec, 100,000 requests/month).
+respects the plan limits (≈100 requests/sec, 1,000,000 requests/month).
 
 ---
 
@@ -54,7 +55,7 @@ respects the plan limits (≈20 requests/sec, 100,000 requests/month).
 ```mermaid
 flowchart TD
     A([Start dump]) --> B[Phase 0: Reference data<br/>languages · countries · vehicle types · product-name dictionary<br/><i>run once</i>]
-    B --> C[Seed targets from dump_targets.csv<br/>→ a work queue of make+model rows<br/><i>no API calls</i>]
+    B --> C[Read targets from rapid_api_dump_targets<br/>→ the make+model work queue (DB = source of truth)<br/><i>no API calls · imported once from CSV</i>]
     C --> D{Worker pool<br/>8 workers share one rate limit}
     D --> E1[Worker claims<br/>next target]
     D --> E2[Worker claims<br/>next target]
@@ -75,6 +76,17 @@ flowchart TD
 The work queue is **resumable**: each make+model is `pending → resumable → complete`, and
 cursors are written only *after* data is saved. If the job crashes or hits the monthly
 quota, the next run picks up exactly where it stopped and never re-charges for finished work.
+
+> **Two traversal modes (`CRAWL_MODE` in `.env`):**
+> - **`depth_first`** (default, shown above) — take one manufacturer and crawl it to full
+>   depth before the next. Best for getting priority brands *completely* done first.
+> - **`breadth_first`** — finish each *level* across ALL targets before going deeper:
+>   all manufacturers → all models → all vehicles → all categories → all articles → all
+>   details. Best for broad shallow coverage first (every make/model/vehicle on record
+>   before spending the expensive detail calls).
+>
+> Both modes share the same per-entity cursors, so you can pause, switch `CRAWL_MODE`, and
+> resume — the next run just continues from the stored state.
 
 ---
 
@@ -164,13 +176,16 @@ Each row carries the brand, the model, and — crucially — the TecDoc IDs the 
 | `tec_model_name` | `COROLLA Saloon (_E18_)` | stored as the model name |
 | `cc_brand_slug`, `cc_model_slug`, … | `toyota`, `corolla` | our own catalog slugs |
 
-The script reads the CSV, **keeps only rows that have both a valid make ID and model ID**
-(rows missing either are skipped), de-duplicates repeated make+model pairs, and loads them
-into a database work-queue. **No API is called here** — the make and model come straight
-from the CSV, so we skip the usual "list all manufacturers / list all models" calls entirely.
+The CSV is imported **once** (`dumper.cli import-targets`): the script **keeps only rows
+that have both a valid make ID and model ID** (rows missing either are skipped),
+de-duplicates repeated make+model pairs, and loads just the make/model ids + names (with
+`status='pending'`) into the **`rapid_api_dump_targets`** work-queue. **No API is called
+here** — the make and model come straight from the CSV, so we skip the usual "list all
+manufacturers / list all models" calls entirely.
 
-Re-running with an edited CSV only *adds* new rows; anything already finished keeps its
-`complete` status (resume-safe).
+After the import, **the table is the source of truth** — the dump never reads the CSV
+again; you add/edit/remove targets directly in Postgres. Re-importing an edited CSV only
+*adds* new rows; anything already finished keeps its `complete` status (resume-safe).
 
 ---
 
@@ -218,24 +233,29 @@ the Arabic engine/fuel/body text.
 **What the script does with it:**
 1. **De-duplicate** by vehicle ID (the source repeats the same vehicle with different
    engine codes).
-2. **Store ALL of them** — even if a model has 24 variants, every one is saved.
-3. **Rank them latest-first**: still-in-production engines first, then newest end-date,
-   then newest start-date.
-4. **Only the top 5 (the latest 5 variants) get deep-crawled** in the next phases. The
-   rest stay saved as records and can be crawled later by raising the limit.
+2. **Store ALL of them** — even if a model has 24 variants, every one is saved. **Diesel
+   (and any `VEHICLE_FUEL_EXCLUDE_PREFIXES`) variants are stored too, but flagged
+   `is_fuel_excluded` (crawl_rank NULL)** so they're listed in the DB yet skipped from the
+   deep crawl. Flip the flag later to deep-crawl one — zero re-fetch.
+3. **Rank the non-excluded variants latest-first**: still-in-production engines first, then
+   newest end-date, then newest start-date.
+4. **Only the top `MAX_VEHICLES_PER_MODEL` non-excluded variants get deep-crawled** in the
+   next phases (the rest stay saved as records, crawl later by raising the limit).
+   **`MAX_VEHICLES_PER_MODEL=0` means no cap — crawl ALL non-excluded variants** (the
+   current setting).
 
-> **Why 5?** Deep-crawling every engine variant multiplies every downstream call. The
-> latest 5 cover the vast majority of real-world parts demand. This is the single biggest
-> budget lever in the whole script.
+> **Why a cap?** Deep-crawling every engine variant multiplies every downstream call, so
+> `MAX_VEHICLES_PER_MODEL` is the single biggest budget lever — set it to the latest N to
+> cover the bulk of real-world parts demand, or `0` to crawl every (non-diesel) variant.
 
 ```mermaid
 flowchart TD
     M[Model] --> C["1 endpoint × 2 calls<br/>list-vehicles-types · EN + AR"]
     C --> ALL["Full list of engine variants<br/>(e.g. 24 vehicles)"]
-    ALL --> STORE[(Store ALL · ranked latest-first)]
-    STORE --> TOP{{Take latest 5}}
-    TOP --> DEEP[These 5 → deep crawl<br/>categories + articles]
-    STORE -.->|the other 19 stay as<br/>records, crawl later| LATER[/not crawled now/]
+    ALL --> STORE[(Store ALL · ranked latest-first<br/>diesel stored + flagged)]
+    STORE --> TOP{{Take top MAX_VEHICLES_PER_MODEL<br/>0 = all non-diesel}}
+    TOP --> DEEP[These → deep crawl<br/>categories + articles]
+    STORE -.->|lower-ranked / diesel stay as<br/>records, crawl later| LATER[/not crawled now/]
     style TOP fill:#fff9c4,stroke:#f9a825
     style DEEP fill:#e8f5e9,stroke:#388e3c
 ```
@@ -249,7 +269,8 @@ and model image `GET /models/type-id/1/model-id/{modelId}`.)*
 
 ### Phase 3 — Per vehicle: get the category tree (all categories)
 
-For each of the **latest 5 vehicles**, the script fetches the full **category tree** — the
+For each of the **top-ranked non-diesel vehicles** (`MAX_VEHICLES_PER_MODEL`; `0` = all),
+the script fetches the full **category tree** — the
 nested groups of parts that fit that exact vehicle (Braking System → Disc Brake → Brake Pad,
 etc.). Called **twice in parallel** (English + Arabic) and the **entire tree is stored** —
 every node, with its English name, Arabic name, and full path.
@@ -488,9 +509,9 @@ The catalog is a strict hierarchy. Each level is fetched per parent of the level
 
 ```mermaid
 flowchart TD
-    CSV[dump_targets.csv<br/>make + model shortlist] --> MAKE[Manufacturer]
+    CSV[rapid_api_dump_targets<br/>make + model shortlist] --> MAKE[Manufacturer]
     MAKE --> MODEL[Model]
-    MODEL -->|list-vehicles-types · EN+AR| VEH[Vehicle / engine variant<br/>★ store all · crawl latest 5]
+    MODEL -->|list-vehicles-types · EN+AR| VEH[Vehicle / engine variant<br/>★ store all · crawl top-N · 0=all · diesel skipped]
     VEH -->|products-groups-variant-2 · EN+AR| CAT[Category tree<br/>★ store whole tree]
     CAT --> LEAF[Leaf category]
     LEAF -->|articles/list · EN| ART[Article = the part<br/>★ store all · rank]
@@ -505,14 +526,15 @@ flowchart TD
 ### The "store-all, crawl top-N" funnel (the heart of the script)
 
 ```
-                       SEEN by the API              SAVED            DEEP-CRAWLED
-  Vehicles per model     ~24 variants      →    all ~24 stored   →   latest 5
+                       SEEN by the API              SAVED              DEEP-CRAWLED
+  Vehicles per model     ~24 variants      →    all ~24 stored   →   top MAX_VEHICLES_PER_MODEL (0 = all non-diesel)
   Categories per vehicle  hundreds         →    whole tree       →   all leaves
-  Articles per category   hundreds         →    all stored       →   top 2 detailed
+  Articles per category   hundreds         →    all stored       →   top MAX_ARTICLES_PER_CATEGORY detailed
 ```
 
-Everything the API shows us is saved. The 5 / 2 limits only decide where we spend the
-expensive calls *today* — widening coverage later is a config change, not a re-crawl.
+Everything the API shows us is saved. The `MAX_VEHICLES_PER_MODEL` / `MAX_ARTICLES_PER_CATEGORY`
+limits only decide where we spend the expensive calls *today* — widening coverage later is a
+config change, not a re-crawl.
 
 ---
 

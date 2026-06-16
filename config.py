@@ -47,15 +47,30 @@ class Settings(BaseSettings):
     MAX_VEHICLES_PER_MODEL: int = Field(default=5, description="Latest N vehicles per model to fully crawl (0 = all)")
     MAX_ARTICLES_PER_CATEGORY: int = Field(default=2, description="Top N articles per (vehicle, category) to fetch full details for (0 = all)")
 
-    # ==================== FUEL-TYPE FILTER (exclude-by-prefix) ====================
-    # Drop vehicles (engine variants) whose fuelType STARTS WITH any of these prefixes,
-    # checked against BOTH the English (lang 4) and Arabic (lang 42) fuelType. The filter
-    # runs BEFORE ranking, so crawl_rank (and the top-N deep crawl) is computed over the
-    # KEPT set only. Comma-separated, case-insensitive. Empty = no filter (store all fuels).
+    # ==================== CRAWL MODE (traversal strategy) ====================
+    # depth_first  = take one manufacturer and crawl it to full depth (models →
+    #                vehicles → categories → articles → details) before the next.
+    #                Parallel make-major: N workers claim targets A→Z. (current default)
+    # breadth_first = finish each LEVEL across ALL targets before going deeper:
+    #                all manufacturers → all models → all vehicles → all categories →
+    #                all articles → all details. Broad shallow coverage first.
+    # Both modes share the same per-entity cursors → safe to switch and resume.
+    CRAWL_MODE: str = Field(
+        default="depth_first",
+        description="Traversal strategy: 'depth_first' (per-manufacturer) or 'breadth_first' (level-by-level across all targets).",
+    )
+
+    # ==================== FUEL-TYPE FILTER (store-but-skip-by-prefix) ====================
+    # Vehicles (engine variants) whose fuelType STARTS WITH any of these prefixes —
+    # checked against BOTH the English (lang 4) and Arabic (lang 42) fuelType — are
+    # still STORED/LISTED in the DB but FLAGGED (is_fuel_excluded = TRUE, crawl_rank
+    # NULL) so they are SKIPPED from the deep crawl (categories/articles/details) in
+    # both modes. crawl_rank (top-N) is computed over the KEPT (non-excluded) set only.
+    # Comma-separated, case-insensitive. Empty = no filter (deep-crawl all fuels).
     # Default excludes diesel: "Diesel" and "Diesel/Electric" (EN) + "ديزل" (AR).
     VEHICLE_FUEL_EXCLUDE_PREFIXES: str = Field(
         default="diesel,ديزل",
-        description="fuelType prefixes to EXCLUDE from the dump (EN+AR, comma-separated, case-insensitive). Empty = keep all.",
+        description="fuelType prefixes to STORE-BUT-SKIP from the deep crawl (EN+AR, comma-separated, case-insensitive). Empty = deep-crawl all.",
     )
 
     # ==================== DATABASE CONFIGURATION ====================
@@ -66,9 +81,9 @@ class Settings(BaseSettings):
     POSTGRES_DB_PASSWORD: str = Field(default="", description="Database password")
 
     # ==================== DUMP TUNING ====================
-    # Plan limits: 20 requests/second, 100,000 requests/month (hard).
-    RAPIDAPI_RATE_LIMIT_PER_SEC: int = Field(default=20, description="Global RapidAPI rate limit (requests/second) — plan hard limit")
-    MONTHLY_REQUEST_HARD_LIMIT: int = Field(default=100_000, description="RapidAPI monthly request hard limit (plan)")
+    # Plan limits: 20 requests/second, 1,000,000 requests/month (hard).
+    RAPIDAPI_RATE_LIMIT_PER_SEC: int = Field(default=100, description="Global RapidAPI rate limit (requests/second) — plan hard limit")
+    MONTHLY_REQUEST_HARD_LIMIT: int = Field(default=1_000_000, description="RapidAPI monthly request hard limit (plan)")
     MONTHLY_REQUEST_SAFETY_BUFFER: int = Field(default=500, description="Stop this many calls BEFORE the monthly hard limit, to never overshoot")
     # 5s, not 60: the token bucket prevents 429s; a stray one must not stall every worker for a minute.
     COOLDOWN_429_SEC: int = Field(default=5, description="Cooldown after 429 (per-second burst limit)")
@@ -92,7 +107,7 @@ class Settings(BaseSettings):
     # One process, N concurrent target-workers, all sharing ONE token bucket that
     # caps the combined API rate. Workers = lanes; rate = the speed limit.
     DUMP_WORKERS: int = Field(default=8, description="Concurrent target (make/model) workers in one process")
-    DUMP_RATE_PER_SEC: float = Field(default=18.0, description="Global token-bucket fill rate (req/s) — keep under the plan's 20/s")
+    DUMP_RATE_PER_SEC: float = Field(default=90.0, description="Global token-bucket fill rate (req/s) — keep under the plan's 100/s (10% margin avoids 429s)")
     LIST_FANOUT: int = Field(default=8, description="Concurrent leaf-category article-list fetches per target")
     DETAILS_FANOUT: int = Field(default=4, description="Concurrent article-details fetches per target")
     KEY_FLUSH_INTERVAL_SEC: float = Field(default=5.0, description="Seconds between key/quota counter flushes to the DB")
@@ -128,6 +143,11 @@ class Settings(BaseSettings):
     def effective_rate_per_sec(self) -> float:
         """Token-bucket fill rate, never above the plan's hard per-second limit."""
         return min(float(self.DUMP_RATE_PER_SEC), float(self.RAPIDAPI_RATE_LIMIT_PER_SEC))
+
+    @property
+    def is_breadth_first(self) -> bool:
+        """True when CRAWL_MODE selects the level-by-level (breadth-first) traversal."""
+        return (self.CRAWL_MODE or "").strip().lower() == "breadth_first"
 
     @property
     def monthly_request_ceiling(self) -> int:
