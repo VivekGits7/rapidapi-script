@@ -437,6 +437,31 @@ async def _run_breadth_first(job_id: str, pc: dict, n_workers: int, limit: int,
     veh_cap = settings.MAX_VEHICLES_PER_MODEL
     art_cap = settings.MAX_ARTICLES_PER_CATEGORY
 
+    # Resume fast-path: B1/B2 have no per-entity cursor, so without this they re-fetch the
+    # (best-effort) brand image + model meta/image for EVERY in-scope target on every resume
+    # (~hundreds of API calls) before reaching articles. Precompute which makes/models a prior
+    # run already seeded → skip their API calls below. Rows + target.resumable still get ensured.
+    make_exts = [int(t["tec_manufacturer_id"]) for t in scope]
+    model_exts = [int(t["tec_model_id"]) for t in scope]
+    imaged_makes = await execute_query(
+        """SELECT manufacturers_external_id FROM rapid_api_manufacturers
+           WHERE manufacturers_external_id = ANY($1::int[]) AND manufacturer_image_api_url IS NOT NULL""",
+        make_exts,
+    )
+    makes_with_image = {int(r["manufacturers_external_id"]) for r in imaged_makes}
+    seeded_rows = await execute_query(
+        """SELECT mf.manufacturers_external_id AS make_ext, m.models_external_id AS model_ext
+           FROM rapid_api_models m
+           JOIN rapid_api_manufacturers mf ON mf.manufacturer_id = m.manufacturer_id
+           WHERE m.models_external_id = ANY($1::int[])""",
+        model_exts,
+    )
+    seeded_model_pairs = {(int(r["make_ext"]), int(r["model_ext"])) for r in seeded_rows}
+    logger.info(
+        f"Breadth resume fast-path: {len(seeded_model_pairs)}/{len(scope)} models already seeded "
+        f"(skip B2 meta/image), {len(makes_with_image)} makes already imaged (skip B1 image)"
+    )
+
     stop_after = (until or "details").strip().lower()
     if stop_after not in _BREADTH_PHASES:
         stop_after = "details"
@@ -488,11 +513,13 @@ async def _run_breadth_first(job_id: str, pc: dict, n_workers: int, limit: int,
         seen_makes.setdefault(int(t["tec_manufacturer_id"]), t)
 
     async def _do_manufacturer(t) -> None:
+        make_ext = int(t["tec_manufacturer_id"])
         image = None
-        try:
-            image = await fetch_manufacturer_image(int(t["tec_manufacturer_id"]))
-        except Exception as e:  # noqa: BLE001 — best-effort brand image
-            logger.warning(f"Manufacturer image fetch failed for {t['tec_manufacturer_id']}: {e}")
+        if make_ext not in makes_with_image:  # skip the brand-image call when already stored
+            try:
+                image = await fetch_manufacturer_image(make_ext)
+            except Exception as e:  # noqa: BLE001 — best-effort brand image
+                logger.warning(f"Manufacturer image fetch failed for {make_ext}: {e}")
         mfg_id = await upsert_manufacturer(t["tec_manufacturer_id"], t["tec_manufacturer_name"], image)
         if mfg_id:
             await upsert_mvt(mfg_id, pc["vehicle_type_id"], pc["type_code"])
@@ -504,6 +531,11 @@ async def _run_breadth_first(job_id: str, pc: dict, n_workers: int, limit: int,
 
     # B2 — Models (all targets): AR name + production years + image, then mark target resumable.
     async def _do_model(t) -> None:
+        # Resume fast-path: a model a prior run already seeded skips B2's best-effort meta/image
+        # API calls — the row + its meta are in, just keep the target resumable and move on.
+        if (int(t["tec_manufacturer_id"]), int(t["tec_model_id"])) in seeded_model_pairs:
+            await targets.mark_resumable(t["target_id"])
+            return
         mfg = await execute_query_one(
             "SELECT manufacturer_id FROM rapid_api_manufacturers WHERE manufacturers_external_id = $1",
             int(t["tec_manufacturer_id"]),
