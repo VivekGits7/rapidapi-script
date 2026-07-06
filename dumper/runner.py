@@ -161,6 +161,7 @@ async def dump_main(
     makes: Optional[list[int]] = None,
     models: Optional[list[int]] = None,
     until: Optional[str] = None,
+    only: Optional[str] = None,
 ) -> dict:
     """Run the dump with N concurrent target-workers sharing one token bucket.
 
@@ -172,6 +173,8 @@ async def dump_main(
                 to the given makes (when --makes is also passed).
     until       breadth_first only: stop cleanly after this phase (manufacturers |
                 models | vehicles | categories | articles | details). Resume continues.
+    only        'details' → skip the listing crawl and only enrich already-stored
+                articles (details_only pass; includes already-'complete' targets).
     """
     if manage_pool:
         await create_db_pool()
@@ -281,7 +284,14 @@ async def dump_main(
         # attempted_incomplete: targets API-failed/partial this run → deferred (gates completion).
         state: dict[str, Any] = {"processed": 0, "quota_exc": None, "attempted_incomplete": set()}
 
-        if settings.is_breadth_first:
+        if only == "details":
+            logger.info("only=details — details-only pass: enrich ALL already-stored articles, "
+                        "skipping vehicle/category/article listing "
+                        f"(MAX_ARTICLES_PER_CATEGORY={settings.MAX_ARTICLES_PER_CATEGORY}, 0 = every article)"
+                        f"{f' | makes={makes}' if makes else ''}{f' | models={models}' if models else ''}"
+                        f"{f' | limit={limit}' if limit else ''}")
+            await _run_details_only(job_id, n_workers, limit, makes, models, check_stop, stop_event, state)
+        elif settings.is_breadth_first:
             logger.info(f"CRAWL_MODE=breadth_first — level-by-level sweep across all targets"
                         f"{f' | makes={makes}' if makes else ''}{f' | models={models}' if models else ''}"
                         f"{f' | limit={limit}' if limit else ''}{f' | until={until}' if until else ''}")
@@ -365,7 +375,66 @@ async def dump_main(
             await close_db_pool()
 
 
-# ==================== CRAWL ORCHESTRATORS (depth-first / breadth-first) ====================
+# ==================== CRAWL ORCHESTRATORS (depth-first / breadth-first / details-only) ====================
+async def _run_details_only(job_id: str, n_workers: int, limit: int,
+                            makes: Optional[list[int]], models: Optional[list[int]],
+                            check_stop: StopCheck, stop_event: asyncio.Event, state: dict) -> None:
+    """Details-only pass — fetch complete-details for articles ALREADY stored, WITHOUT
+    crawling any more vehicles/categories/article-lists.
+
+    Sweeps every model (optionally filtered by --makes/--models tec ids) and runs
+    complete_articles_for_model on it, which details that model's still-incomplete
+    articles up to MAX_ARTICLES_PER_CATEGORY per (vehicle, category) — set that to 0 to
+    detail EVERY stored article. Unlike the breadth/depth crawl this ignores target
+    status, so the already-'complete' targets get their lower-rank articles detailed too.
+    Empty models no-op instantly (the per-model scan returns nothing), so it's safe to
+    sweep all of them. Honors stop + quota exactly like the breadth sweep.
+    """
+    model_rows = await execute_query(
+        """
+        SELECT m.model_id
+        FROM rapid_api_models m
+        JOIN rapid_api_manufacturers mf ON mf.manufacturer_id = m.manufacturer_id
+        WHERE (cardinality($1::int[]) = 0 OR mf.manufacturers_external_id = ANY($1::int[]))
+          AND (cardinality($2::int[]) = 0 OR m.models_external_id = ANY($2::int[]))
+        ORDER BY mf.manufacturers_external_id, m.models_external_id
+        """,
+        makes or [], models or [],
+    )
+    models_list = model_rows[:limit] if (limit and limit > 0) else model_rows
+    if not models_list:
+        logger.info("Details-only: no models in scope")
+        return
+    state["processed"] = len(models_list)
+    logger.info(f"Details-only: {len(models_list)} model(s), "
+                f"MAX_ARTICLES_PER_CATEGORY={settings.MAX_ARTICLES_PER_CATEGORY} (0 = all stored articles)")
+    await _set_phase(job_id, "details_only")
+
+    sem = asyncio.Semaphore(max(1, n_workers))
+    abort = {"flag": False}
+
+    async def _one(m) -> None:
+        if stop_event.is_set() or abort["flag"]:
+            return
+        async with sem:
+            if stop_event.is_set() or abort["flag"]:
+                return
+            try:
+                await complete_articles_for_model(m["model_id"], check_stop)
+            except (AllKeysExhaustedError, MonthlyQuotaReachedError) as e:
+                state["quota_exc"] = e
+                abort["flag"] = True
+                stop_event.set()
+            except StopRequested:
+                abort["flag"] = True
+                stop_event.set()
+            except Exception as e:  # noqa: BLE001 — one model never kills the pass
+                logger.error(f"Details-only model {m['model_id']} failed: {e}", exc_info=True)
+
+    await asyncio.gather(*[_one(m) for m in models_list])
+    await _refresh_counts(job_id)
+
+
 async def _run_depth_first(job_id: str, pc: dict, n_workers: int, limit: int,
                            makes: Optional[list[int]], models: Optional[list[int]],
                            check_stop: StopCheck, stop_event: asyncio.Event, state: dict) -> None:

@@ -47,6 +47,8 @@ _run_options = [
     click.option("--models", type=str, default=None, help="Comma-separated tec_model_ids to crawl (e.g. 4635,10615). Validated against the CSV; combine with --makes for a safety check."),
     click.option("--until", type=click.Choice(["manufacturers", "models", "vehicles", "categories", "articles", "details"]),
                  default=None, help="breadth_first only: stop cleanly AFTER this phase (e.g. categories). Resume later to continue. Omit = all phases."),
+    click.option("--only", type=click.Choice(["details"]), default=None,
+                 help="Run ONLY this phase, skipping the listing crawl. `--only details` fetches full details for ALL already-stored articles (top MAX_ARTICLES_PER_CATEGORY per category; set it to 0 for every article) and includes already-'complete' targets. Omit = normal full crawl."),
 ]
 
 
@@ -63,14 +65,14 @@ def cli():
 
 @cli.command()
 @_with_run_options
-def run(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str], until: Optional[str]):
+def run(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str], until: Optional[str], only: Optional[str]):
     """Run the dump — creates a new job if none active; otherwise resumes."""
     from dumper.runner import dump_main
 
     try:
         result = asyncio.run(
             dump_main(mode="run", limit=limit, workers=workers, rate=rate,
-                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"), until=until)
+                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"), until=until, only=only)
         )
         _print_json(result)
     except KeyboardInterrupt:
@@ -84,14 +86,14 @@ def run(limit: int, workers: Optional[int], rate: Optional[float], makes: Option
 
 @cli.command()
 @_with_run_options
-def resume(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str], until: Optional[str]):
+def resume(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str], until: Optional[str], only: Optional[str]):
     """Resume the latest paused/failed job. Errors if there's nothing to resume."""
     from dumper.runner import dump_main
 
     try:
         result = asyncio.run(
             dump_main(mode="resume", limit=limit, workers=workers, rate=rate,
-                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"), until=until)
+                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"), until=until, only=only)
         )
         _print_json(result)
     except KeyboardInterrupt:
