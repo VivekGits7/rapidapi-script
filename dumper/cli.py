@@ -1,14 +1,20 @@
 """CLI entry point for the dumper.
 
 Usage:
-    guvrun -m dumper.cli import-targets            # ONE-TIME: load dump_targets.csv into the DB (source of truth)
-    guvrun -m dumper.cli run                       # one-shot full dump (resumes if a job is in flight)
-    guvrun -m dumper.cli run --workers 8 --rate 18 # parallel crawl at ~18 req/s (defaults from .env)
-    guvrun -m dumper.cli run --makes 5,16,21       # only these tec_manufacturer_ids
-    guvrun -m dumper.cli resume                    # explicit resume (errors if no resumable job)
-    guvrun -m dumper.cli status                    # print latest job state
-    guvrun -m dumper.cli stop                      # signal running dump to stop gracefully
-    guvrun -m dumper.cli reset --yes-i-am-sure     # DANGEROUS: wipe all dumped data + sequences
+    guvrun -m dumper.cli import-targets                                           # ONE-TIME: load PC dump_targets.csv (source of truth)
+    guvrun -m dumper.cli import-targets --csv archive/new/cv_models.csv --vehicle-type cv    # load CV models
+    guvrun -m dumper.cli import-targets --csv archive/new/bus_models.csv --vehicle-type bus  # load bus models
+    guvrun -m dumper.cli run                        # one-shot PC dump (resumes the PC job if in flight)
+    guvrun -m dumper.cli run --vehicle-type cv      # crawl the CV job (independent of PC — its own resumable job)
+    guvrun -m dumper.cli run --workers 8 --rate 18  # parallel crawl at ~18 req/s (defaults from .env)
+    guvrun -m dumper.cli run --makes 5,16,21        # only these tec_manufacturer_ids
+    guvrun -m dumper.cli resume --vehicle-type cv   # explicit resume of the CV job (errors if none resumable)
+    guvrun -m dumper.cli status --vehicle-type cv   # print the CV job state
+    guvrun -m dumper.cli stop --vehicle-type cv     # stop the running CV dump gracefully
+    guvrun -m dumper.cli reset --yes-i-am-sure      # DANGEROUS: wipe all dumped data + sequences
+
+Each vehicle type (pc | cv | bus | ...) is a SEPARATE, independently-resumable job:
+resume PC and CV whenever you want without one touching the other.
 """
 
 import asyncio
@@ -39,7 +45,29 @@ def _parse_ids(value: Optional[str], flag: str) -> Optional[list[int]]:
     return ids or None
 
 
+def _resolve_vehicle_type(value: Optional[str]) -> Optional[int]:
+    """'pc'/'cv'/'bus'/... (any case) or '1'/'2'/'8' → TecDoc vehicle type id.
+    None/empty → None (caller defaults to PC / settings.DEFAULT_TYPE_ID)."""
+    from dumper.state import CODE_TO_TYPE_ID, TYPE_ID_TO_CODE
+
+    if not value:
+        return None
+    v = value.strip().upper()
+    if v in CODE_TO_TYPE_ID:
+        return CODE_TO_TYPE_ID[v]
+    try:
+        tid = int(v)
+    except ValueError:
+        raise click.BadParameter(
+            f"--vehicle-type must be a code ({', '.join(CODE_TO_TYPE_ID)}) or a numeric id, got: {value!r}"
+        )
+    if tid not in TYPE_ID_TO_CODE:
+        raise click.BadParameter(f"--vehicle-type id {tid} unknown; valid ids: {sorted(TYPE_ID_TO_CODE)}")
+    return tid
+
+
 _run_options = [
+    click.option("--vehicle-type", "vehicle_type", type=str, default=None, help="Which vehicle type to crawl: pc | cv | bus | ... or the numeric TecDoc id (default: pc). Scopes the job + targets — PC and CV are independent, each with its own resumable job."),
     click.option("--limit", type=int, default=0, help="Process at most N targets this run (0 = all). Use --limit 1 for a smoke test."),
     click.option("--workers", type=int, default=None, help="Concurrent target workers (default: DUMP_WORKERS from .env)."),
     click.option("--rate", type=float, default=None, help="Global req/s across all workers (default: DUMP_RATE_PER_SEC; clamped to the plan's 100/s)."),
@@ -65,14 +93,15 @@ def cli():
 
 @cli.command()
 @_with_run_options
-def run(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str], until: Optional[str], only: Optional[str]):
-    """Run the dump — creates a new job if none active; otherwise resumes."""
+def run(vehicle_type: Optional[str], limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str], until: Optional[str], only: Optional[str]):
+    """Run the dump — creates a new job (per vehicle type) if none active; otherwise resumes that type's job."""
     from dumper.runner import dump_main
 
     try:
         result = asyncio.run(
             dump_main(mode="run", limit=limit, workers=workers, rate=rate,
-                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"), until=until, only=only)
+                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"), until=until, only=only,
+                      vehicle_type_id=_resolve_vehicle_type(vehicle_type))
         )
         _print_json(result)
     except KeyboardInterrupt:
@@ -86,14 +115,15 @@ def run(limit: int, workers: Optional[int], rate: Optional[float], makes: Option
 
 @cli.command()
 @_with_run_options
-def resume(limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str], until: Optional[str], only: Optional[str]):
-    """Resume the latest paused/failed job. Errors if there's nothing to resume."""
+def resume(vehicle_type: Optional[str], limit: int, workers: Optional[int], rate: Optional[float], makes: Optional[str], models: Optional[str], until: Optional[str], only: Optional[str]):
+    """Resume the latest paused/failed job FOR THIS vehicle type. Errors if there's nothing to resume."""
     from dumper.runner import dump_main
 
     try:
         result = asyncio.run(
             dump_main(mode="resume", limit=limit, workers=workers, rate=rate,
-                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"), until=until, only=only)
+                      makes=_parse_ids(makes, "--makes"), models=_parse_ids(models, "--models"), until=until, only=only,
+                      vehicle_type_id=_resolve_vehicle_type(vehicle_type))
         )
         _print_json(result)
     except KeyboardInterrupt:
@@ -106,20 +136,25 @@ def resume(limit: int, workers: Optional[int], rate: Optional[float], makes: Opt
 
 
 @cli.command(name="import-targets")
-@click.option("--csv", "csv_path", type=str, default=None, help="Path to the targets CSV (default: DUMP_TARGETS_CSV from .env).")
-def import_targets(csv_path: Optional[str]):
-    """ONE-TIME import of dump_targets.csv into rapid_api_dump_targets.
+@click.option("--csv", "csv_path", type=str, default=None, help="Path to the targets CSV (default: DUMP_TARGETS_CSV from .env). Accepts PC (tec_*) or CV/bus (make/manufacturer_id/model_*) columns.")
+@click.option("--vehicle-type", "vehicle_type", type=str, default=None, help="Tag imported rows with this vehicle type: pc | cv | bus | ... or numeric id (default: pc).")
+def import_targets(csv_path: Optional[str], vehicle_type: Optional[str]):
+    """ONE-TIME import of a make/model CSV into rapid_api_dump_targets.
 
     The table is the source of truth after this — the dump no longer reads the CSV.
     Idempotent: re-running refreshes names and ADDS new rows; existing statuses stay.
+    Every imported row is tagged with --vehicle-type so PC/CV/bus coexist and each
+    is crawled by its own independently-resumable job.
     """
     from dumper import targets
     from services.db import close_db_pool, create_db_pool
 
+    vt = _resolve_vehicle_type(vehicle_type)
+
     async def _run() -> dict:
         await create_db_pool()
         try:
-            return await targets.import_targets_from_csv(csv_path)
+            return await targets.import_targets_from_csv(csv_path, vehicle_type_id=vt)
         finally:
             await close_db_pool()
 
@@ -132,12 +167,13 @@ def import_targets(csv_path: Optional[str]):
 
 
 @cli.command()
-def status():
+@click.option("--vehicle-type", "vehicle_type", type=str, default=None, help="Show the latest job for this vehicle type (pc | cv | bus | ... or id). Omit = latest job of any type.")
+def status(vehicle_type: Optional[str]):
     """Print the latest dump-job state from the DB. Safe to run anytime."""
     from dumper.runner import get_status
 
     try:
-        state = asyncio.run(get_status())
+        state = asyncio.run(get_status(vehicle_type_id=_resolve_vehicle_type(vehicle_type)))
         _print_json(state)
     except Exception as e:
         click.echo(f"ERROR: {e}", err=True)
@@ -145,24 +181,26 @@ def status():
 
 
 @cli.command()
-def counts():
+@click.option("--vehicle-type", "vehicle_type", type=str, default=None, help="Scope target progress to this vehicle type (pc | cv | bus | ... or id). Omit = all types.")
+def counts(vehicle_type: Optional[str]):
     """Print RapidAPI call totals, this month's usage vs ceiling, and target progress."""
     from dumper.runner import get_api_counts
 
     try:
-        _print_json(asyncio.run(get_api_counts()))
+        _print_json(asyncio.run(get_api_counts(vehicle_type_id=_resolve_vehicle_type(vehicle_type))))
     except Exception as e:
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)
 
 
 @cli.command()
-def stop():
+@click.option("--vehicle-type", "vehicle_type", type=str, default=None, help="Stop the running job for this vehicle type (pc | cv | bus | ... or id). Omit = latest running job of any type.")
+def stop(vehicle_type: Optional[str]):
     """Signal the running dump to stop gracefully (writes stop_requested = TRUE)."""
     from dumper.runner import request_stop
 
     try:
-        result = asyncio.run(request_stop())
+        result = asyncio.run(request_stop(vehicle_type_id=_resolve_vehicle_type(vehicle_type)))
         _print_json(result)
     except Exception as e:
         click.echo(f"ERROR: {e}", err=True)

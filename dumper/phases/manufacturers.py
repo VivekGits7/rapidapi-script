@@ -15,7 +15,7 @@ from typing import Optional
 from config import settings
 from dumper.http_client import api_get
 from dumper.id_utils import new_id
-from dumper.state import VehicleTypeCode
+from dumper.state import TYPE_ID_TO_CODE, VehicleTypeCode
 from logger import get_logger
 from services.db import execute_command, execute_query_one
 
@@ -81,18 +81,21 @@ async def fetch_model_image(api_type_id: int, model_external_id: int) -> Optiona
     return img or None
 
 
-async def get_pc_vehicle_type() -> Optional[dict]:
-    """Return the Passenger Car vehicle_type row (uuid + external id + code).
+async def get_active_vehicle_type() -> Optional[dict]:
+    """Return the ACTIVE vehicle_type row (uuid + external id + code) for this run.
 
-    Seeded by the reference phase. Returns None if reference hasn't run yet.
+    The active type is `settings.DEFAULT_TYPE_ID` (1=PC, 2=CV, ...), which the CLI
+    `--vehicle-type` flag sets at process start. Seeded by the reference phase;
+    returns None if reference hasn't run yet or the id is unknown.
     """
+    type_code = TYPE_ID_TO_CODE.get(int(settings.DEFAULT_TYPE_ID), VehicleTypeCode.PC.value)
     row = await execute_query_one(
         """
         SELECT vehicle_type_id, vehicle_types_external_id AS api_type_id, type_code
         FROM rapid_api_vehicle_types
         WHERE type_code = $1
         """,
-        VehicleTypeCode.PC.value,
+        type_code,
     )
     return dict(row) if row else None
 

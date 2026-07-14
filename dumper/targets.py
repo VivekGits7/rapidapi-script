@@ -51,54 +51,66 @@ def _to_int(value: Optional[str]) -> Optional[int]:
         return None
 
 
-async def import_targets_from_csv(csv_path: Optional[str] = None) -> dict:
-    """ONE-TIME import of dump_targets.csv into rapid_api_dump_targets. Idempotent.
+async def import_targets_from_csv(
+    csv_path: Optional[str] = None, vehicle_type_id: Optional[int] = None
+) -> dict:
+    """ONE-TIME import of a make/model CSV into rapid_api_dump_targets. Idempotent.
 
-    Stores only the essential columns (make/model ids + names + status). Run via
-    `dumper.cli import-targets`; the runner does NOT call this — the table is the
-    source of truth once imported.
+    Stores only the essential columns (vehicle type + make/model ids + names + status).
+    Run via `dumper.cli import-targets`; the runner does NOT call this — the table is
+    the source of truth once imported.
 
-    - New (make, model) rows → inserted as 'pending'.
+    - `vehicle_type_id` tags every imported row (1=PC, 2=CV, 8=BUS, ...); defaults to
+      settings.DEFAULT_TYPE_ID (which the CLI --vehicle-type flag sets).
+    - Accepts BOTH column layouts transparently:
+        · PC targets: tec_manufacturer_id / tec_manufacturer_name / tec_model_id / tec_model_name
+        · CV/bus lists: manufacturer_id / make / model_id / model_name
+    - New (type, make, model) rows → inserted as 'pending'.
     - Existing rows → names refreshed, status untouched (resume-safe).
-    Returns {seeded, skipped, total} counts.
+    Returns {seeded, skipped, total} counts (total = rows for THIS vehicle type).
     """
+    vt = int(vehicle_type_id) if vehicle_type_id is not None else int(settings.DEFAULT_TYPE_ID)
     resolved = csv_path if (csv_path and os.path.exists(csv_path)) else _resolve_csv_path()
     skipped = 0
-    # Dedup by (tec_manufacturer_id, tec_model_id): the CSV repeats pairs, and a
-    # single multi-row upsert can't touch the same conflict key twice. Last wins.
+    # Dedup by (vehicle_type_id, tec_manufacturer_id, tec_model_id): the CSV repeats pairs,
+    # and a single multi-row upsert can't touch the same conflict key twice. Last wins.
     by_key: dict[tuple, tuple] = {}
     with open(resolved, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            tec_mfg_id = _to_int(row.get("tec_manufacturer_id"))
-            tec_model_id = _to_int(row.get("tec_model_id"))
+            # Support both the PC header (tec_*) and the CV/bus header (make/manufacturer_id/model_*).
+            tec_mfg_id = _to_int(row.get("tec_manufacturer_id") or row.get("manufacturer_id"))
+            tec_model_id = _to_int(row.get("tec_model_id") or row.get("model_id"))
             if tec_mfg_id is None or tec_model_id is None:
                 skipped += 1
                 continue
-            by_key[(tec_mfg_id, tec_model_id)] = (
+            by_key[(vt, tec_mfg_id, tec_model_id)] = (
+                vt,
                 tec_mfg_id,
-                (row.get("tec_manufacturer_name") or "").strip() or None,
+                (row.get("tec_manufacturer_name") or row.get("make") or "").strip() or None,
                 tec_model_id,
-                (row.get("tec_model_name") or "").strip() or None,
+                (row.get("tec_model_name") or row.get("model_name") or "").strip() or None,
                 TargetStatus.PENDING.value,
             )
 
-    # ONE batched upsert instead of 647 sequential round-trips (~230s → <1s on a
+    # ONE batched upsert instead of N sequential round-trips (~230s → <1s on a
     # remote DB). DO UPDATE refreshes names only; status is NOT touched → resume-safe.
     seeded = await bulk_insert(
         "rapid_api_dump_targets",
-        ["tec_manufacturer_id", "tec_manufacturer_name", "tec_model_id", "tec_model_name", "status"],
+        ["vehicle_type_id", "tec_manufacturer_id", "tec_manufacturer_name", "tec_model_id", "tec_model_name", "status"],
         list(by_key.values()),
-        """ON CONFLICT (tec_manufacturer_id, tec_model_id) DO UPDATE SET
+        """ON CONFLICT (vehicle_type_id, tec_manufacturer_id, tec_model_id) DO UPDATE SET
                tec_manufacturer_name = EXCLUDED.tec_manufacturer_name,
                tec_model_name        = EXCLUDED.tec_model_name,
                updated_at            = NOW()""",
     )
 
-    total_row = await execute_query_one("SELECT COUNT(*) AS n FROM rapid_api_dump_targets")
+    total_row = await execute_query_one(
+        "SELECT COUNT(*) AS n FROM rapid_api_dump_targets WHERE vehicle_type_id = $1", vt
+    )
     total = int(total_row["n"]) if total_row else 0
-    logger.info(f"Targets imported from {resolved}: {seeded} rows ({skipped} skipped) in 1 batch, {total} in table")
-    return {"seeded": seeded, "skipped": skipped, "total": total}
+    logger.info(f"Targets imported from {resolved}: {seeded} rows ({skipped} skipped) as vehicle_type_id={vt}, {total} of that type in table")
+    return {"seeded": seeded, "skipped": skipped, "total": total, "vehicle_type_id": vt}
 
 
 # ==================== LINE-ORDER ITERATION ====================
@@ -107,6 +119,7 @@ async def claim_next_target(
     exclude_ids: Optional[list] = None,
     makes: Optional[list[int]] = None,
     models: Optional[list[int]] = None,
+    vehicle_type_id: Optional[int] = None,
 ) -> Optional[asyncpg.Record]:
     """Atomically CLAIM the next not-complete target, A→Z by make then model.
 
@@ -116,8 +129,10 @@ async def claim_next_target(
     RESUMABLE (work already started) before PENDING. `exclude_ids` skips
     targets already attempted or currently in flight this run; `makes` /
     `models` restrict claiming to those tec_manufacturer_ids / tec_model_ids
-    (--makes / --models flags).
+    (--makes / --models flags). `vehicle_type_id` scopes claiming to ONE
+    vehicle type (1=PC, 2=CV, ...) so PC and CV runs never touch each other.
     """
+    vt = int(vehicle_type_id) if vehicle_type_id is not None else int(settings.DEFAULT_TYPE_ID)
     return await execute_query_one(
         """
         UPDATE rapid_api_dump_targets t
@@ -126,6 +141,7 @@ async def claim_next_target(
             SELECT target_id
             FROM rapid_api_dump_targets
             WHERE status <> $1
+              AND vehicle_type_id = $6
               AND NOT (target_id = ANY($3::uuid[]))
               AND (cardinality($4::int[]) = 0 OR tec_manufacturer_id = ANY($4::int[]))
               AND (cardinality($5::int[]) = 0 OR tec_model_id = ANY($5::int[]))
@@ -143,6 +159,7 @@ async def claim_next_target(
         exclude_ids or [],
         makes or [],
         models or [],
+        vt,
     )
 
 
@@ -150,18 +167,22 @@ async def scope_targets(
     makes: Optional[list[int]] = None,
     models: Optional[list[int]] = None,
     limit: int = 0,
+    vehicle_type_id: Optional[int] = None,
 ) -> list:
     """All not-complete targets in scope (A→Z by make then model), for breadth-first mode.
 
-    Honors --makes / --models (tec ids) and --limit (first N targets). Complete targets
-    are skipped — their data is already in, and the level sweeps would no-op on them anyway.
+    Honors --makes / --models (tec ids), --limit (first N targets), and the active
+    `vehicle_type_id` (PC/CV/... scoping). Complete targets are skipped — their data is
+    already in, and the level sweeps would no-op on them anyway.
     """
+    vt = int(vehicle_type_id) if vehicle_type_id is not None else int(settings.DEFAULT_TYPE_ID)
     rows = await execute_query(
         """
         SELECT target_id, tec_manufacturer_id, tec_manufacturer_name,
                tec_model_id, tec_model_name, status
         FROM rapid_api_dump_targets
         WHERE status <> $1
+          AND vehicle_type_id = $4
           AND (cardinality($2::int[]) = 0 OR tec_manufacturer_id = ANY($2::int[]))
           AND (cardinality($3::int[]) = 0 OR tec_model_id = ANY($3::int[]))
         ORDER BY tec_manufacturer_name ASC, tec_model_name ASC
@@ -169,6 +190,7 @@ async def scope_targets(
         TargetStatus.COMPLETE.value,
         makes or [],
         models or [],
+        vt,
     )
     return rows[:limit] if (limit and limit > 0) else rows
 
@@ -216,10 +238,18 @@ async def record_target_error(target_id: str, message: str) -> None:
     )
 
 
-async def target_counts() -> dict:
-    rows = await execute_query(
-        "SELECT status, COUNT(*) AS n FROM rapid_api_dump_targets GROUP BY status"
-    )
+async def target_counts(vehicle_type_id: Optional[int] = None) -> dict:
+    """Per-status target counts. `vehicle_type_id` scopes to one type (1=PC, 2=CV, ...);
+    None counts every type (all-up view)."""
+    if vehicle_type_id is not None:
+        rows = await execute_query(
+            "SELECT status, COUNT(*) AS n FROM rapid_api_dump_targets WHERE vehicle_type_id = $1 GROUP BY status",
+            int(vehicle_type_id),
+        )
+    else:
+        rows = await execute_query(
+            "SELECT status, COUNT(*) AS n FROM rapid_api_dump_targets GROUP BY status"
+        )
     counts = {s.value: 0 for s in TargetStatus}
     for r in rows:
         counts[r["status"]] = int(r["n"])

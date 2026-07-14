@@ -362,6 +362,7 @@ CREATE INDEX idx_rapid_api_media_pending ON rapid_api_article_media(media_id) WH
 -- ==========================================================================
 CREATE TABLE rapid_api_dump_jobs (
     job_id                   UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    vehicle_type_id          INT          NOT NULL DEFAULT 1,        -- TecDoc vehicle type this job crawls (1=PC, 2=CV, ...)
     status                   VARCHAR(20)  NOT NULL DEFAULT 'idle',  -- idle|running|paused|completed|failed
     current_phase            VARCHAR(40)  NOT NULL DEFAULT 'idle',  -- idle|reference|manufacturers|deep_crawl|articles|enrich|media|completed|failed|paused
     started_at               TIMESTAMPTZ,
@@ -396,6 +397,7 @@ CREATE TABLE rapid_api_dump_jobs (
 );
 CREATE INDEX idx_rapid_api_dump_jobs_status     ON rapid_api_dump_jobs(status);
 CREATE INDEX idx_rapid_api_dump_jobs_created_at ON rapid_api_dump_jobs(created_at DESC);
+CREATE INDEX idx_rapid_api_dump_jobs_type_status ON rapid_api_dump_jobs(vehicle_type_id, status);
 
 -- ==========================================================================
 -- UNPARSED ITEMS (never silently drop anything the API returns)
@@ -440,6 +442,7 @@ CREATE INDEX idx_rapid_api_api_key_state_cooldown ON rapid_api_api_key_state(coo
 -- ==========================================================================
 CREATE TABLE rapid_api_dump_targets (
     target_id              UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    vehicle_type_id        INT          NOT NULL DEFAULT 1,  -- TecDoc vehicle type (1=PC, 2=CV, ...)
     tec_manufacturer_id    INT          NOT NULL,        -- TecDoc make external id
     tec_manufacturer_name  VARCHAR(255),
     tec_model_id           INT          NOT NULL,        -- TecDoc model external id
@@ -450,13 +453,14 @@ CREATE TABLE rapid_api_dump_targets (
     last_error             TEXT,
     created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    UNIQUE (tec_manufacturer_id, tec_model_id),          -- re-import is idempotent
+    CONSTRAINT rapid_api_dump_targets_type_make_model_key
+        UNIQUE (vehicle_type_id, tec_manufacturer_id, tec_model_id),  -- re-import is idempotent, per vehicle type
     CONSTRAINT rapid_api_dump_targets_status_check CHECK (status IN ('pending','resumable','complete'))
 );
 CREATE INDEX idx_rapid_api_dump_targets_status  ON rapid_api_dump_targets(status);
 CREATE INDEX idx_rapid_api_dump_targets_make    ON rapid_api_dump_targets(tec_manufacturer_id);
--- "next not-complete target, A→Z by make then model" is O(1)
-CREATE INDEX idx_rapid_api_dump_targets_pending ON rapid_api_dump_targets(tec_manufacturer_name, tec_model_name)
+-- "next not-complete target for THIS vehicle type, A→Z by make then model" is O(1)
+CREATE INDEX idx_rapid_api_dump_targets_pending ON rapid_api_dump_targets(vehicle_type_id, tec_manufacturer_name, tec_model_name)
     WHERE status <> 'complete';
 
 -- ==========================================================================

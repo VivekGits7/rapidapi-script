@@ -44,7 +44,7 @@ from dumper.phases.manufacturers import (
     fetch_models_meta,
     fetch_model_image,
     fetch_manufacturer_image,
-    get_pc_vehicle_type,
+    get_active_vehicle_type,
     upsert_manufacturer,
     upsert_model,
     upsert_mvt,
@@ -73,16 +73,23 @@ STALE_RUNNING_SECS = 120
 
 
 # ==================== JOB LIFECYCLE ====================
-async def _get_or_create_job(mode: str) -> str:
+async def _get_or_create_job(mode: str, vehicle_type_id: int) -> str:
+    """Resume the latest not-finished job FOR THIS vehicle type, else create one.
+
+    Jobs are scoped per vehicle type, so a PC job (type 1) and a CV job (type 2)
+    are independent — resuming/creating one never touches the other.
+    """
     existing = await execute_query_one(
         """
         SELECT job_id, status FROM rapid_api_dump_jobs
         WHERE status IN ('running', 'paused', 'failed')
+          AND vehicle_type_id = $1
         ORDER BY created_at DESC LIMIT 1
-        """
+        """,
+        vehicle_type_id,
     )
     if existing:
-        logger.info(f"Resuming job {existing['job_id']} (was status={existing['status']})")
+        logger.info(f"Resuming job {existing['job_id']} (vehicle_type_id={vehicle_type_id}, was status={existing['status']})")
         await execute_command(
             """
             UPDATE rapid_api_dump_jobs
@@ -94,18 +101,19 @@ async def _get_or_create_job(mode: str) -> str:
         return existing["job_id"]
 
     if mode == "resume":
-        raise NoResumableJobError("No paused or failed job to resume")
+        raise NoResumableJobError(f"No paused or failed job to resume for vehicle_type_id={vehicle_type_id}")
 
     job_id = await new_id("dump_jobs")
     await execute_command(
         """
-        INSERT INTO rapid_api_dump_jobs (job_id, status, current_phase, started_at)
-        VALUES ($1, 'running', $2, NOW())
+        INSERT INTO rapid_api_dump_jobs (job_id, vehicle_type_id, status, current_phase, started_at)
+        VALUES ($1, $2, 'running', $3, NOW())
         """,
         job_id,
+        vehicle_type_id,
         DumpPhase.REFERENCE.value,
     )
-    logger.info(f"Created new dump job {job_id}")
+    logger.info(f"Created new dump job {job_id} (vehicle_type_id={vehicle_type_id})")
     return job_id
 
 
@@ -162,6 +170,7 @@ async def dump_main(
     models: Optional[list[int]] = None,
     until: Optional[str] = None,
     only: Optional[str] = None,
+    vehicle_type_id: Optional[int] = None,
 ) -> dict:
     """Run the dump with N concurrent target-workers sharing one token bucket.
 
@@ -175,13 +184,22 @@ async def dump_main(
                 models | vehicles | categories | articles | details). Resume continues.
     only        'details' → skip the listing crawl and only enrich already-stored
                 articles (details_only pass; includes already-'complete' targets).
+    vehicle_type_id  which TecDoc vehicle type to crawl (1=PC, 2=CV, 8=BUS, ...).
+                Defaults to settings.DEFAULT_TYPE_ID. Scopes the job + targets so PC
+                and CV are independent, each with its own resumable job.
     """
     if manage_pool:
         await create_db_pool()
     configure_bucket(rate)
     await api_key_manager.setup()
 
-    job_id = await _get_or_create_job(mode)
+    # Pin the active vehicle type for THIS process: get_active_vehicle_type() and the
+    # details/compat endpoints (details.py) both read settings.DEFAULT_TYPE_ID, so set
+    # it once here and every downstream call agrees. One process = one vehicle type.
+    active_type_id = int(vehicle_type_id) if vehicle_type_id is not None else int(settings.DEFAULT_TYPE_ID)
+    settings.DEFAULT_TYPE_ID = active_type_id
+
+    job_id = await _get_or_create_job(mode, active_type_id)
     n_workers = max(1, workers or settings.DUMP_WORKERS)
 
     stop_event = asyncio.Event()
@@ -233,10 +251,11 @@ async def dump_main(
         # ---- Targets come from the DB (source of truth) — no CSV seed on run ----
         # The table is populated once via `dumper.cli import-targets`. If it's empty
         # there's nothing to crawl, so pause cleanly with a clear instruction.
-        tgt_counts = await targets.target_counts()
-        logger.info(f"Targets: {tgt_counts}")
+        tgt_counts = await targets.target_counts(active_type_id)
+        logger.info(f"Targets (vehicle_type_id={active_type_id}): {tgt_counts}")
         if tgt_counts.get("total", 0) == 0:
-            msg = "No targets in rapid_api_dump_targets — run `guvrun -m dumper.cli import-targets` first."
+            msg = (f"No vehicle_type_id={active_type_id} targets in rapid_api_dump_targets — "
+                   "run `guvrun -m dumper.cli import-targets --csv <file> --vehicle-type <type>` first.")
             logger.error(msg)
             await _mark(job_id, "paused", DumpPhase.PAUSED.value, msg)
             return await _summary(job_id)
@@ -246,9 +265,11 @@ async def dump_main(
             rows = await execute_query(
                 """
                 SELECT tec_model_id, tec_model_name, tec_manufacturer_id, tec_manufacturer_name
-                FROM rapid_api_dump_targets WHERE tec_model_id = ANY($1::int[])
+                FROM rapid_api_dump_targets
+                WHERE tec_model_id = ANY($1::int[]) AND vehicle_type_id = $2
                 """,
                 models,
+                active_type_id,
             )
             found = {int(r["tec_model_id"]) for r in rows}
             unknown = [m for m in models if m not in found]
@@ -269,9 +290,9 @@ async def dump_main(
                     await _mark(job_id, "paused", DumpPhase.PAUSED.value, msg)
                     return await _summary(job_id)
 
-        pc = await get_pc_vehicle_type()
+        pc = await get_active_vehicle_type()
         if not pc:
-            raise RuntimeError("Passenger Car vehicle_type missing after reference phase")
+            raise RuntimeError(f"vehicle_type for id={active_type_id} missing after reference phase")
 
         # productId → AR-name dictionary. fetch_and_store self-skips (1 cheap DB
         # check) once AR names exist — needed here because resumed jobs skip the
@@ -290,19 +311,19 @@ async def dump_main(
                         f"(MAX_ARTICLES_PER_CATEGORY={settings.MAX_ARTICLES_PER_CATEGORY}, 0 = every article)"
                         f"{f' | makes={makes}' if makes else ''}{f' | models={models}' if models else ''}"
                         f"{f' | limit={limit}' if limit else ''}")
-            await _run_details_only(job_id, n_workers, limit, makes, models, check_stop, stop_event, state)
+            await _run_details_only(job_id, n_workers, limit, makes, models, check_stop, stop_event, state, active_type_id)
         elif settings.is_breadth_first:
             logger.info(f"CRAWL_MODE=breadth_first — level-by-level sweep across all targets"
                         f"{f' | makes={makes}' if makes else ''}{f' | models={models}' if models else ''}"
                         f"{f' | limit={limit}' if limit else ''}{f' | until={until}' if until else ''}")
-            await _run_breadth_first(job_id, pc, n_workers, limit, makes, models, check_stop, stop_event, state, until)
+            await _run_breadth_first(job_id, pc, n_workers, limit, makes, models, check_stop, stop_event, state, until, active_type_id)
         else:
             if until:
                 logger.warning(f"--until {until} is ignored in depth_first mode (per-target full crawl); set CRAWL_MODE=breadth_first to use it")
             logger.info(f"CRAWL_MODE=depth_first — {n_workers} worker(s) @ "
                         f"{settings.effective_rate_per_sec if rate is None else rate} req/s"
                         f"{f' | makes={makes}' if makes else ''}{f' | limit={limit}' if limit else ''}")
-            await _run_depth_first(job_id, pc, n_workers, limit, makes, models, check_stop, stop_event, state)
+            await _run_depth_first(job_id, pc, n_workers, limit, makes, models, check_stop, stop_event, state, active_type_id)
 
         await _refresh_counts(job_id)
 
@@ -325,7 +346,7 @@ async def dump_main(
 
         # ---- Completion ----
         attempted_incomplete = state["attempted_incomplete"]
-        counts = await targets.target_counts()
+        counts = await targets.target_counts(active_type_id)
         if counts.get("pending", 0) == 0 and counts.get("resumable", 0) == 0 and not attempted_incomplete:
             await _set_done_flags(job_id)
             await _mark(job_id, "completed", DumpPhase.COMPLETED.value)
@@ -378,7 +399,8 @@ async def dump_main(
 # ==================== CRAWL ORCHESTRATORS (depth-first / breadth-first / details-only) ====================
 async def _run_details_only(job_id: str, n_workers: int, limit: int,
                             makes: Optional[list[int]], models: Optional[list[int]],
-                            check_stop: StopCheck, stop_event: asyncio.Event, state: dict) -> None:
+                            check_stop: StopCheck, stop_event: asyncio.Event, state: dict,
+                            vehicle_type_id: int) -> None:
     """Details-only pass — fetch complete-details for articles ALREADY stored, WITHOUT
     crawling any more vehicles/categories/article-lists.
 
@@ -395,11 +417,13 @@ async def _run_details_only(job_id: str, n_workers: int, limit: int,
         SELECT m.model_id
         FROM rapid_api_models m
         JOIN rapid_api_manufacturers mf ON mf.manufacturer_id = m.manufacturer_id
-        WHERE (cardinality($1::int[]) = 0 OR mf.manufacturers_external_id = ANY($1::int[]))
+        JOIN rapid_api_vehicle_types vt ON vt.vehicle_type_id = m.vehicle_type_id
+        WHERE vt.vehicle_types_external_id = $3
+          AND (cardinality($1::int[]) = 0 OR mf.manufacturers_external_id = ANY($1::int[]))
           AND (cardinality($2::int[]) = 0 OR m.models_external_id = ANY($2::int[]))
         ORDER BY mf.manufacturers_external_id, m.models_external_id
         """,
-        makes or [], models or [],
+        makes or [], models or [], vehicle_type_id,
     )
     models_list = model_rows[:limit] if (limit and limit > 0) else model_rows
     if not models_list:
@@ -437,9 +461,11 @@ async def _run_details_only(job_id: str, n_workers: int, limit: int,
 
 async def _run_depth_first(job_id: str, pc: dict, n_workers: int, limit: int,
                            makes: Optional[list[int]], models: Optional[list[int]],
-                           check_stop: StopCheck, stop_event: asyncio.Event, state: dict) -> None:
+                           check_stop: StopCheck, stop_event: asyncio.Event, state: dict,
+                           vehicle_type_id: int) -> None:
     """Depth-first: N workers each atomically claim a target (make+model) and crawl it to
-    full depth before claiming the next. Make-major A→Z via the claim ordering."""
+    full depth before claiming the next. Make-major A→Z via the claim ordering. Claiming
+    is scoped to `vehicle_type_id` so this run only touches its own vehicle type."""
     attempted_incomplete: set = state["attempted_incomplete"]
     in_flight: set = set()              # claimed right now → not claimable again
     claim_lock = asyncio.Lock()
@@ -452,7 +478,8 @@ async def _run_depth_first(job_id: str, pc: dict, n_workers: int, limit: int,
                 if limit and state["processed"] >= limit:
                     return
                 target = await targets.claim_next_target(
-                    exclude_ids=list(attempted_incomplete | in_flight), makes=makes, models=models
+                    exclude_ids=list(attempted_incomplete | in_flight), makes=makes, models=models,
+                    vehicle_type_id=vehicle_type_id,
                 )
                 if not target:
                     return  # nothing left to claim (for this run / make filter)
@@ -487,7 +514,7 @@ _BREADTH_PHASES = ["manufacturers", "models", "vehicles", "categories", "article
 async def _run_breadth_first(job_id: str, pc: dict, n_workers: int, limit: int,
                              makes: Optional[list[int]], models: Optional[list[int]],
                              check_stop: StopCheck, stop_event: asyncio.Event, state: dict,
-                             until: Optional[str] = None) -> None:
+                             until: Optional[str] = None, vehicle_type_id: int = 1) -> None:
     """Breadth-first: finish each LEVEL across ALL in-scope targets before going deeper —
     manufacturers → models → vehicles → categories → articles → details. Reuses every phase
     function; resumability rides the existing per-entity cursors. Each level fans out across
@@ -498,7 +525,7 @@ async def _run_breadth_first(job_id: str, pc: dict, n_workers: int, limit: int,
     run continues from the next phase via the per-entity cursors. No-op finalize when stopped
     early, so nothing is marked complete prematurely.
     """
-    scope = await targets.scope_targets(makes=makes, models=models, limit=limit)
+    scope = await targets.scope_targets(makes=makes, models=models, limit=limit, vehicle_type_id=vehicle_type_id)
     if not scope:
         logger.info("Breadth-first: no in-scope targets to crawl")
         return
@@ -638,15 +665,21 @@ async def _run_breadth_first(job_id: str, pc: dict, n_workers: int, limit: int,
         return
 
     # Resolve each in-scope (make, model) to its model_id UUID now that B2 seeded the rows.
+    # Scope the model join to THIS vehicle type so a make+model that exists under more
+    # than one type never resolves to the wrong type's model row.
     resolved = await execute_query(
         """
         SELECT s.make_ext, s.model_ext, m.model_id
         FROM unnest($1::int[], $2::int[]) AS s(make_ext, model_ext)
         JOIN rapid_api_manufacturers mf ON mf.manufacturers_external_id = s.make_ext
-        JOIN rapid_api_models m ON m.models_external_id = s.model_ext AND m.manufacturer_id = mf.manufacturer_id
+        JOIN rapid_api_vehicle_types vt ON vt.vehicle_types_external_id = $3
+        JOIN rapid_api_models m ON m.models_external_id = s.model_ext
+            AND m.manufacturer_id = mf.manufacturer_id
+            AND m.vehicle_type_id = vt.vehicle_type_id
         """,
         [int(t["tec_manufacturer_id"]) for t in scope],
         [int(t["tec_model_id"]) for t in scope],
+        vehicle_type_id,
     )
     model_id_by_pair = {(int(r["make_ext"]), int(r["model_ext"])): r["model_id"] for r in resolved}
     scope_models = [(t, model_id_by_pair.get((int(t["tec_manufacturer_id"]), int(t["tec_model_id"])))) for t in scope]
@@ -881,15 +914,22 @@ async def _model_fully_done(model_id: str, veh_cap: int, art_cap: int) -> bool:
 
 
 # ==================== STATUS / CONTROL ====================
-async def request_stop(manage_pool: bool = True) -> dict:
+async def request_stop(manage_pool: bool = True, vehicle_type_id: Optional[int] = None) -> dict:
     if manage_pool:
         await create_db_pool()
     try:
-        row = await execute_query_one(
-            "SELECT job_id FROM rapid_api_dump_jobs WHERE status = 'running' ORDER BY created_at DESC LIMIT 1"
-        )
+        if vehicle_type_id is not None:
+            row = await execute_query_one(
+                "SELECT job_id FROM rapid_api_dump_jobs WHERE status = 'running' AND vehicle_type_id = $1 ORDER BY created_at DESC LIMIT 1",
+                int(vehicle_type_id),
+            )
+        else:
+            row = await execute_query_one(
+                "SELECT job_id FROM rapid_api_dump_jobs WHERE status = 'running' ORDER BY created_at DESC LIMIT 1"
+            )
         if not row:
-            return {"stopped": False, "message": "No running job to stop"}
+            scope = f" for vehicle_type_id={vehicle_type_id}" if vehicle_type_id is not None else ""
+            return {"stopped": False, "message": f"No running job to stop{scope}"}
         await execute_command(
             "UPDATE rapid_api_dump_jobs SET stop_requested = TRUE, updated_at = NOW() WHERE job_id = $1",
             row["job_id"],
@@ -900,13 +940,20 @@ async def request_stop(manage_pool: bool = True) -> dict:
             await close_db_pool()
 
 
-async def get_status(manage_pool: bool = True) -> dict:
+async def get_status(manage_pool: bool = True, vehicle_type_id: Optional[int] = None) -> dict:
     if manage_pool:
         await create_db_pool()
     try:
-        row = await execute_query_one("SELECT * FROM rapid_api_dump_jobs ORDER BY created_at DESC LIMIT 1")
+        if vehicle_type_id is not None:
+            row = await execute_query_one(
+                "SELECT * FROM rapid_api_dump_jobs WHERE vehicle_type_id = $1 ORDER BY created_at DESC LIMIT 1",
+                int(vehicle_type_id),
+            )
+        else:
+            row = await execute_query_one("SELECT * FROM rapid_api_dump_jobs ORDER BY created_at DESC LIMIT 1")
         if not row:
-            return {"status": "idle", "message": "No dump has been run yet"}
+            scope = f" for vehicle_type_id={vehicle_type_id}" if vehicle_type_id is not None else ""
+            return {"status": "idle", "message": f"No dump has been run yet{scope}"}
         # Honest status: a 'running' row whose heartbeat went stale means the worker
         # died without marking it done (killed / crashed / reloaded). Auto-correct it
         # to 'paused' so /status never lies, and so it's resumable.
@@ -931,7 +978,7 @@ async def get_status(manage_pool: bool = True) -> dict:
             await close_db_pool()
 
 
-async def get_api_counts(manage_pool: bool = True) -> dict:
+async def get_api_counts(manage_pool: bool = True, vehicle_type_id: Optional[int] = None) -> dict:
     if manage_pool:
         await create_db_pool()
     try:
@@ -949,12 +996,13 @@ async def get_api_counts(manage_pool: bool = True) -> dict:
             "total_calls": int(totals_row["total"]) if totals_row else 0,
         }
         month_usage = await api_key_manager.current_month_usage()
-        tgt = await targets.target_counts()
+        tgt = await targets.target_counts(vehicle_type_id)
         return {
             "totals": totals,
             "month_usage": month_usage,
             "monthly_ceiling": settings.monthly_request_ceiling,
             "targets": tgt,
+            "vehicle_type_id": vehicle_type_id,
         }
     finally:
         if manage_pool:
@@ -1069,6 +1117,7 @@ async def _summary(job_id: str) -> dict:
 def _row_to_summary(row: Any, keys_summary: list[dict]) -> dict:
     return {
         "job_id": str(row["job_id"]) if row["job_id"] is not None else None,
+        "vehicle_type_id": row["vehicle_type_id"] if "vehicle_type_id" in row else None,
         "status": row["status"],
         "current_phase": row["current_phase"],
         "stop_requested": row["stop_requested"],
