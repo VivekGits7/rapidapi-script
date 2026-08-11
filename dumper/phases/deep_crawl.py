@@ -143,6 +143,11 @@ async def fetch_vehicles_for_model(
         msg = None if kept else f"all {len(excluded)} vehicles fuel-excluded for model {api_model_id}"
         await _mark_model_vehicles_done(model_id, "has_data", msg)
     else:
+        # An empty list is the phantom-complete signature (e.g. a truck model crawled as PC) — warn loudly.
+        logger.warning(
+            f"Vehicles list EMPTY for model {api_model_id} ({type_code}, type-id {api_type_id}) "
+            "— its target will complete with NO data; verify the vehicle type is right"
+        )
         await _mark_model_vehicles_done(model_id, "empty", f"0 vehicles for model {api_model_id}")
     logger.info(
         f"  Vehicles for model {model_id}: {inserted} stored in 1 batch "
