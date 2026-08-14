@@ -28,13 +28,13 @@ class PhaseCounts(BaseModel):
     models: int = Field(..., examples=[508])
     vehicles: int = Field(..., examples=[9000])
     categories: int = Field(..., examples=[3500])
-    vehicle_categories: int = Field(..., examples=[2500000])
-    articles: Optional[int] = Field(None, examples=[120000])
-    article_categories: Optional[int] = Field(None, examples=[2000000])
-    compatible_cars: Optional[int] = Field(None, examples=[3000000])
-    specs: Optional[int] = Field(None, examples=[800000])
-    oem_refs: Optional[int] = Field(None, examples=[1500000])
-    media: Optional[int] = Field(None, examples=[0])
+    vehicle_categories: int = Field(..., examples=[2500000], description="Estimated row count, not exact")
+    articles: Optional[int] = Field(None, examples=[120000], description="Estimated row count, not exact")
+    article_categories: Optional[int] = Field(None, examples=[2000000], description="Estimated row count, not exact")
+    compatible_cars: Optional[int] = Field(None, examples=[3000000], description="Estimated row count, not exact")
+    specs: Optional[int] = Field(None, examples=[800000], description="Estimated row count, not exact")
+    oem_refs: Optional[int] = Field(None, examples=[1500000], description="Estimated row count, not exact")
+    media: Optional[int] = Field(None, examples=[0], description="Estimated row count, not exact")
 
 
 class KeySummary(BaseModel):
@@ -81,7 +81,7 @@ class TargetCounts(BaseModel):
 class ApiCountsData(BaseModel):
     totals:          ApiCallTotals
     month_usage:     int = Field(..., examples=[18450], description="Calls made this calendar month (all that reached RapidAPI)")
-    monthly_ceiling: int = Field(..., examples=[99500], description="Calls allowed this month (hard limit minus safety buffer)")
+    monthly_ceiling: int = Field(..., examples=[99500], description="Calls allowed this month (hard limit minus safety buffer). 0 means the plan is uncapped and the guard is off")
     targets:         TargetCounts
 
 

@@ -5,7 +5,8 @@ Speed-critical design (see OPTIMIZATION_PLAN.md §3.3): all hot-path state
 once at setup() and receives accumulated deltas every KEY_FLUSH_INTERVAL_SEC
 (or KEY_FLUSH_MAX_PENDING calls), plus a final flush on pause/stop/exit.
 Worst-case crash loses ≤ one flush window of counts — absorbed by the
-MONTHLY_REQUEST_SAFETY_BUFFER.
+MONTHLY_REQUEST_SAFETY_BUFFER. Setting MONTHLY_REQUEST_HARD_LIMIT=0 turns the
+monthly guard off entirely, for a plan with no monthly cap.
 
 Cooldown sets persist immediately (rare events, must survive restarts).
 """
@@ -78,10 +79,16 @@ class APIKeyManager:
             self._pending = 0
             self._last_flush = time.monotonic()
             self._setup_done = True
+        ceiling = settings.monthly_request_ceiling if settings.monthly_quota_enabled else "unlimited"
         logger.info(
             f"APIKeyManager: {len(self._order)} key(s) loaded — {', '.join(self._order)} | "
-            f"month usage {self._month_base}/{settings.monthly_request_ceiling}"
+            f"month usage {self._month_base}/{ceiling}"
         )
+        if not settings.monthly_quota_enabled:
+            logger.warning(
+                "Monthly quota guard is OFF (MONTHLY_REQUEST_HARD_LIMIT=0) — calls will keep going "
+                "past any plan limit and RapidAPI bills the overage; set a limit to re-arm it"
+            )
 
     async def get_next_key(self) -> tuple[str, str]:
         """Return (key_id, key_value) for the next available key. Pure in-memory on the hot path.
@@ -93,7 +100,7 @@ class APIKeyManager:
         while True:
             wait_sec = 0.0
             async with self._lock:
-                if self._month_base + self._month_delta >= settings.monthly_request_ceiling:
+                if settings.monthly_quota_enabled and self._month_base + self._month_delta >= settings.monthly_request_ceiling:
                     await self._flush_locked()
                     raise MonthlyQuotaReachedError(
                         f"Monthly usage {self._month_base} reached ceiling {settings.monthly_request_ceiling} "
@@ -242,7 +249,7 @@ class APIKeyManager:
         self._pending = 0
         self._last_flush = time.monotonic()
 
-    # ==================== MONTHLY USAGE (100k/month guard) ====================
+    # ==================== MONTHLY USAGE (plan-limit guard) ====================
     @staticmethod
     def _current_period() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m")

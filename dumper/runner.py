@@ -1062,29 +1062,51 @@ async def _set_done_flags(job_id: str) -> None:
 
 
 async def _refresh_counts(job_id: str) -> None:
-    row = await execute_query_one(
-        """
-        SELECT
-          (SELECT COUNT(*) FROM rapid_api_languages)               AS languages,
-          (SELECT COUNT(*) FROM rapid_api_countries)               AS countries,
-          (SELECT COUNT(*) FROM rapid_api_vehicle_types)           AS vehicle_types,
-          (SELECT COUNT(*) FROM rapid_api_manufacturers)           AS manufacturers,
-          (SELECT COUNT(*) FROM rapid_api_manufacturer_vehicle_types) AS mvt,
-          (SELECT COUNT(*) FROM rapid_api_models)                  AS models,
-          (SELECT COUNT(*) FROM rapid_api_vehicles)                AS vehicles,
-          (SELECT COUNT(*) FROM rapid_api_categories)              AS categories,
-          (SELECT COUNT(*) FROM rapid_api_vehicle_categories)      AS vca,
-          (SELECT COUNT(*) FROM rapid_api_articles)                AS articles,
-          (SELECT COUNT(*) FROM rapid_api_category_articles)       AS article_categories,
-          (SELECT COUNT(*) FROM rapid_api_article_compatible_cars) AS compatible_cars,
-          (SELECT COUNT(*) FROM rapid_api_article_specs)           AS specs,
-          (SELECT COUNT(*) FROM rapid_api_article_oem_refs)        AS oem_refs,
-          (SELECT COUNT(*) FROM rapid_api_article_media)           AS media,
-          (SELECT COALESCE(SUM(total_calls), 0) FROM rapid_api_api_key_state) AS api_calls
-        """
-    )
-    if not row:
-        return
+    """Update the job's progress counters. Best-effort: never let telemetry kill a crawl.
+
+    The fact tables run to tens of millions of rows (compatible_cars alone is ~19 GB), and an
+    exact COUNT(*) has to walk every one of them — that took minutes and blew the command
+    timeout mid-crawl. Those use the planner's row estimate instead, which is free to read and
+    close enough for a progress readout that 8 workers invalidate the moment it lands. The small
+    reference tables stay exact because scanning them costs nothing.
+    """
+    try:
+        row = await execute_query_one(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM rapid_api_languages)               AS languages,
+              (SELECT COUNT(*) FROM rapid_api_countries)               AS countries,
+              (SELECT COUNT(*) FROM rapid_api_vehicle_types)           AS vehicle_types,
+              (SELECT COUNT(*) FROM rapid_api_manufacturers)           AS manufacturers,
+              (SELECT COUNT(*) FROM rapid_api_manufacturer_vehicle_types) AS mvt,
+              (SELECT COUNT(*) FROM rapid_api_models)                  AS models,
+              (SELECT COUNT(*) FROM rapid_api_vehicles)                AS vehicles,
+              (SELECT COUNT(*) FROM rapid_api_categories)              AS categories,
+              (SELECT GREATEST(reltuples, 0)::BIGINT FROM pg_class
+                WHERE oid = 'rapid_api_vehicle_categories'::regclass)      AS vca,
+              (SELECT GREATEST(reltuples, 0)::BIGINT FROM pg_class
+                WHERE oid = 'rapid_api_articles'::regclass)                AS articles,
+              (SELECT GREATEST(reltuples, 0)::BIGINT FROM pg_class
+                WHERE oid = 'rapid_api_category_articles'::regclass)       AS article_categories,
+              (SELECT GREATEST(reltuples, 0)::BIGINT FROM pg_class
+                WHERE oid = 'rapid_api_article_compatible_cars'::regclass) AS compatible_cars,
+              (SELECT GREATEST(reltuples, 0)::BIGINT FROM pg_class
+                WHERE oid = 'rapid_api_article_specs'::regclass)           AS specs,
+              (SELECT GREATEST(reltuples, 0)::BIGINT FROM pg_class
+                WHERE oid = 'rapid_api_article_oem_refs'::regclass)        AS oem_refs,
+              (SELECT GREATEST(reltuples, 0)::BIGINT FROM pg_class
+                WHERE oid = 'rapid_api_article_media'::regclass)           AS media,
+              (SELECT COALESCE(SUM(total_calls), 0) FROM rapid_api_api_key_state) AS api_calls
+            """
+        )
+        if not row:
+            return
+        await _write_counts(job_id, row)
+    except Exception as e:  # noqa: BLE001 — progress numbers are cosmetic; the crawl must go on
+        logger.warning(f"Count refresh skipped: {e}")
+
+
+async def _write_counts(job_id: str, row: Any) -> None:
     await execute_command(
         """
         UPDATE rapid_api_dump_jobs

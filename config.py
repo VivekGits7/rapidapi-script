@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     # ==================== DUMP TUNING ====================
     # Plan limits: 20 requests/second, 1,000,000 requests/month (hard).
     RAPIDAPI_RATE_LIMIT_PER_SEC: int = Field(default=100, description="Global RapidAPI rate limit (requests/second) — plan hard limit")
-    MONTHLY_REQUEST_HARD_LIMIT: int = Field(default=1_000_000, description="RapidAPI monthly request hard limit (plan)")
+    MONTHLY_REQUEST_HARD_LIMIT: int = Field(default=1_000_000, description="RapidAPI monthly request hard limit (plan). Set 0 for an uncapped plan to turn the guard off")
     MONTHLY_REQUEST_SAFETY_BUFFER: int = Field(default=500, description="Stop this many calls BEFORE the monthly hard limit, to never overshoot")
     # 5s, not 60: the token bucket prevents 429s; a stray one must not stall every worker for a minute.
     COOLDOWN_429_SEC: int = Field(default=5, description="Cooldown after 429 (per-second burst limit)")
@@ -150,8 +150,13 @@ class Settings(BaseSettings):
         return (self.CRAWL_MODE or "").strip().lower() == "breadth_first"
 
     @property
+    def monthly_quota_enabled(self) -> bool:
+        """False when MONTHLY_REQUEST_HARD_LIMIT is 0, i.e. the plan has no monthly cap to guard."""
+        return self.MONTHLY_REQUEST_HARD_LIMIT > 0
+
+    @property
     def monthly_request_ceiling(self) -> int:
-        """Stop making calls once the month's usage reaches this (hard limit minus buffer)."""
+        """Stop making calls once the month's usage reaches this (hard limit minus buffer). 0 = no ceiling."""
         return max(0, self.MONTHLY_REQUEST_HARD_LIMIT - self.MONTHLY_REQUEST_SAFETY_BUFFER)
 
     @property

@@ -168,6 +168,7 @@ async def status_dump(request: Request) -> StatusDumpResponse:
 
     - Safe to call anytime, even when no dump has ever run (returns `status: 'idle'`).
     - Includes per-key cooldowns and total API calls made.
+    - Row counts for the large fact tables are estimates, the small reference tables are exact.
     """
     state = await get_status(manage_pool=False)
     if state.get("status") == "idle":
@@ -193,11 +194,11 @@ async def status_dump(request: Request) -> StatusDumpResponse:
 @limiter.limit("60/minute")
 async def api_counts(request: Request) -> ApiCountsResponse:
     """
-    Get RapidAPI call counts + the 100k/month budget + target progress.
+    Get RapidAPI call counts + the monthly budget + target progress.
 
     - **totals**: success / failed / total calls that reached RapidAPI (all-time)
     - **month_usage**: calls made this calendar month
-    - **monthly_ceiling**: calls allowed this month (hard limit minus safety buffer) — the dump pauses at this
+    - **monthly_ceiling**: calls allowed this month (hard limit minus safety buffer) — the dump pauses at this, 0 means uncapped and the guard is off
     - **targets**: pending / resumable / complete make-model targets
     - Network errors (no HTTP response from RapidAPI) are NOT counted
     """
