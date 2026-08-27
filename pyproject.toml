@@ -17,6 +17,8 @@ dependencies = [
     "asyncpg>=0.29.0",
     # HTTP client
     "httpx>=0.27.0",
+    # AWS (S3 image mirror)
+    "boto3>=1.40.0",
     # CLI
     "click>=8.1.7",
 ]

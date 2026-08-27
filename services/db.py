@@ -17,18 +17,21 @@ logger = get_logger(__name__)
 _pool: Optional[asyncpg.Pool] = None
 
 
-async def create_db_pool() -> None:
+async def create_db_pool(max_size: Optional[int] = None) -> None:
+    """Create the shared pool. `max_size` lets side scripts that run next to the
+    dumper take a few connections instead of a full POSTGRES_POOL_MAX of their own."""
     global _pool
     if _pool is not None:
         return
+    max_size = max_size or settings.POSTGRES_POOL_MAX
     _pool = await asyncpg.create_pool(
         host=settings.POSTGRES_DB_HOST,
         port=settings.POSTGRES_DB_PORT,
         user=settings.POSTGRES_DB_USER,
         password=settings.POSTGRES_DB_PASSWORD,
         database=settings.POSTGRES_DB_NAME,
-        min_size=2,
-        max_size=settings.POSTGRES_POOL_MAX,
+        min_size=min(2, max_size),
+        max_size=max_size,
         command_timeout=settings.POSTGRES_COMMAND_TIMEOUT,
         # Detect half-open connections to a remote DB fast (NAT/VPN drops) so the
         # pool recycles them instead of a query hanging until command_timeout.
