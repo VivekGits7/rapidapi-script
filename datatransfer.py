@@ -173,6 +173,27 @@ def _sync_enum_types(psql: str, src: dict, dst: dict) -> None:
 
 
 # ==================== main ====================
+def _sync_trigger_functions(psql: str, dst: dict) -> None:
+    """Create the browse trigger functions on dest. pg_dump --table carries a table's triggers but not the
+    functions they call, so a fresh dest would otherwise fail on the CREATE TRIGGER lines of the restore."""
+    from dumper.schema import TRIGGER_FUNCTIONS_SQL
+
+    fd, path = tempfile.mkstemp(prefix="datatransfer_fn_", suffix=".sql")
+    os.close(fd)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(TRIGGER_FUNCTIONS_SQL)
+    try:
+        rc = subprocess.run(
+            [psql, "-h", dst["host"], "-p", str(dst["port"]), "-U", dst["user"], "-d", dst["dbname"],
+             "-v", "ON_ERROR_STOP=1", "-q", "-f", path],
+            env=_env(dst),
+        ).returncode
+        if rc != 0:
+            print("  warn: could not create the browse trigger functions on dest; the restore may fail on its triggers")
+    finally:
+        os.remove(path)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Transfer specific tables between two Postgres DBs.")
     for side, d in (("src", SOURCE), ("dst", DEST)):
@@ -258,6 +279,7 @@ def main() -> None:
     # ensure the source's custom enum types exist on DEST (pg_dump --table omits
     # them; a fresh dest DB would otherwise fail on 'type ... does not exist')
     _sync_enum_types(psql, src, dst)
+    _sync_trigger_functions(psql, dst)
 
     # dump SOURCE → temp .sql (clean+if-exists makes the restore idempotent)
     fd, dump_path = tempfile.mkstemp(prefix="datatransfer_", suffix=".sql")

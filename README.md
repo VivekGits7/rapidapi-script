@@ -73,6 +73,8 @@ guvrun -m dumper.cli status          # latest job state + counts
 guvrun -m dumper.cli counts          # API usage, monthly ceiling, target progress
 guvrun -m dumper.cli stop            # graceful stop (pauses at next checkpoint)
 guvrun -m dumper.cli reset --yes-i-am-sure   # DANGER: truncate all dump tables
+guvrun -m dumper.cli ensure-schema   # create/repair the browse index, link table and triggers the backend reads (run does this at startup); --backfill also fills the table
+guvrun backfill_category_links.py    # link table backfill, server side loop + parallel workers, live progress bar; --status shows how far it is
 ```
 
 > **`--limit` = number of `dump_targets.csv` rows (make/model targets)** processed

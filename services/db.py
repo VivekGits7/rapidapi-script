@@ -174,3 +174,10 @@ async def transaction() -> AsyncIterator[Any]:
     async with pool.acquire() as conn:
         async with conn.transaction():
             yield conn
+
+
+@asynccontextmanager
+async def acquire() -> AsyncIterator[Any]:
+    """A raw pooled connection for work that needs per statement timeouts, such as schema DDL and backfills."""
+    async with _get_pool().acquire() as conn:
+        yield conn

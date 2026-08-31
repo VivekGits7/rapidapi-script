@@ -287,10 +287,74 @@ CREATE TABLE rapid_api_category_articles (
     UNIQUE (vehicle_id, category_id, article_id)          -- ON CONFLICT DO NOTHING
 );
 CREATE INDEX idx_rapid_api_cat_articles_article  ON rapid_api_category_articles(article_id);
-CREATE INDEX idx_rapid_api_cat_articles_category ON rapid_api_category_articles(category_id);
+-- Category browse and article counts read (category_id, article_id) straight off this index, no heap visits.
+CREATE INDEX idx_rapid_api_cat_articles_category_article ON rapid_api_category_articles(category_id, article_id);
 CREATE INDEX idx_rapid_api_cat_articles_vehicle  ON rapid_api_category_articles(vehicle_id);
 -- "next articles to complete" = low rank, within the cap
 CREATE INDEX idx_rapid_api_cat_articles_rank     ON rapid_api_category_articles(rank);
+
+-- ==================== CATEGORY <-> ARTICLE LINKS (browse summary) ====================
+-- One row per (category, article) no matter how many vehicles link them, with the two article
+-- columns the buyer browse filters and sorts on copied in. The triggers keep it in step with
+-- rapid_api_category_articles and rapid_api_articles inside the same transaction, so
+-- GET /catalog/articles/{category_id} and the leaf article counts read one short index range
+-- instead of millions of per vehicle link rows.
+CREATE TABLE IF NOT EXISTS rapid_api_category_article_links (
+    category_id UUID NOT NULL REFERENCES rapid_api_categories(category_id) ON DELETE CASCADE,
+    article_id  UUID NOT NULL REFERENCES rapid_api_articles(article_id)    ON DELETE CASCADE,
+    dump_state  rapid_api_dump_state NOT NULL,
+    article_no  VARCHAR(100),
+    PRIMARY KEY (category_id, article_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rapid_api_cat_article_links_browse
+    ON rapid_api_category_article_links(category_id, dump_state, article_no, article_id);
+CREATE INDEX IF NOT EXISTS idx_rapid_api_cat_article_links_article
+    ON rapid_api_category_article_links(article_id);
+
+CREATE OR REPLACE FUNCTION catalog_link_category_article() RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO rapid_api_category_article_links (category_id, article_id, dump_state, article_no)
+    SELECT NEW.category_id, NEW.article_id, a.dump_state, a.article_no
+      FROM rapid_api_articles a
+     WHERE a.article_id = NEW.article_id
+    ON CONFLICT (category_id, article_id) DO NOTHING;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION catalog_unlink_category_article() RETURNS TRIGGER AS $$
+BEGIN
+    DELETE FROM rapid_api_category_article_links l
+     WHERE l.category_id = OLD.category_id
+       AND l.article_id = OLD.article_id
+       AND NOT EXISTS (
+            SELECT 1 FROM rapid_api_category_articles ca
+             WHERE ca.category_id = OLD.category_id AND ca.article_id = OLD.article_id
+       );
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION catalog_sync_article_links() RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE rapid_api_category_article_links
+       SET dump_state = NEW.dump_state, article_no = NEW.article_no
+     WHERE article_id = NEW.article_id;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER trg_catalog_link_category_article
+    AFTER INSERT ON rapid_api_category_articles
+    FOR EACH ROW EXECUTE FUNCTION catalog_link_category_article();
+CREATE OR REPLACE TRIGGER trg_catalog_unlink_category_article
+    AFTER DELETE ON rapid_api_category_articles
+    FOR EACH ROW EXECUTE FUNCTION catalog_unlink_category_article();
+CREATE OR REPLACE TRIGGER trg_catalog_sync_article_links
+    AFTER UPDATE OF dump_state, article_no ON rapid_api_articles
+    FOR EACH ROW
+    WHEN (OLD.dump_state IS DISTINCT FROM NEW.dump_state OR OLD.article_no IS DISTINCT FROM NEW.article_no)
+    EXECUTE FUNCTION catalog_sync_article_links();
 
 -- Article ↔ Vehicle fitment (compatible cars), DENORMALIZED from
 -- article-complete-details. These vehicles span models we did NOT target, so we

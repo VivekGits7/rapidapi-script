@@ -36,6 +36,7 @@ from error import AllKeysExhaustedError, MonthlyQuotaReachedError, NoResumableJo
 from dumper.id_utils import new_id
 from dumper.key_manager import api_key_manager
 from dumper.rate_limiter import configure_bucket
+from dumper.schema import ensure_browse_schema
 from dumper.state import DumpPhase, DumpEntityState, DumpStage, StopRequested
 from dumper import product_names, targets
 from dumper.http_client import close_http_client
@@ -192,6 +193,8 @@ async def dump_main(
         await create_db_pool()
     configure_bucket(rate)
     await api_key_manager.setup()
+    # The backend's browse queries depend on this index, link table, and triggers; make sure this DB has them.
+    await ensure_browse_schema()
 
     # Pin the active vehicle type for THIS process: get_active_vehicle_type() and the
     # details/compat endpoints (details.py) both read settings.DEFAULT_TYPE_ID, so set
@@ -1020,6 +1023,7 @@ async def reset_dump(manage_pool: bool = True) -> dict:
                 "rapid_api_article_specs",
                 "rapid_api_article_oem_refs",
                 "rapid_api_article_compatible_cars",
+                "rapid_api_category_article_links",
                 "rapid_api_category_articles",
                 "rapid_api_articles",
                 "rapid_api_product_names",
