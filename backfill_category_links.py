@@ -235,11 +235,22 @@ async def run_backfill(args: argparse.Namespace, timeout: float) -> None:
         print(f"done   : {state['rows']:,} link rows, indexes: {state['indexes']}, total {_fmt_secs(time.monotonic() - started)}")
 
 
+async def mark_done_only(timeout: float) -> None:
+    """Set the done marker on a table a finished run left unmarked, no rows touched."""
+    async with acquire() as conn:
+        print(f"target : {_target()}")
+        await mark_backfill_done(conn)
+        state = await _state(conn)
+        print(f"marked : {state['rows']:,} link rows, indexes: {state['indexes']}")
+
+
 async def _main(args: argparse.Namespace) -> None:
     await create_db_pool(max_size=args.workers + 1)
     try:
         if args.status:
             await show_status(settings.SCHEMA_DDL_TIMEOUT, args.reconcile)
+        elif args.mark_done:
+            await mark_done_only(settings.SCHEMA_DDL_TIMEOUT)
         else:
             await run_backfill(args, settings.SCHEMA_DDL_TIMEOUT)
     finally:
@@ -252,6 +263,7 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=50, help="Categories per server round trip (default 50).")
     ap.add_argument("--limit", type=int, default=0, help="Only the N biggest categories, a smoke test; leaves the table unmarked.")
     ap.add_argument("--status", action="store_true", help="Only report how far the backfill is, write nothing.")
+    ap.add_argument("--mark-done", action="store_true", help="Only set the done marker, for a run that finished but failed to mark the table.")
     ap.add_argument("--reconcile", action="store_true", help="Compare every category even if a full pass already completed.")
     ap.add_argument("--any-db", action="store_true", help="Allow a database whose name lacks sandbox or test.")
     args = ap.parse_args()

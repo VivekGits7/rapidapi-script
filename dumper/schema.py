@@ -242,7 +242,15 @@ async def backfill_marked_done(conn: Any) -> bool:
 
 
 async def mark_backfill_done(conn: Any) -> None:
-    await conn.execute(f"COMMENT ON TABLE {LINKS_TABLE} IS '{BACKFILL_DONE_MARKER} ' || to_char(now(), 'YYYY-MM-DD HH24:MI TZ')")
+    # COMMENT ON only accepts a literal, so the timestamped text is assembled inside a DO block.
+    await conn.execute(
+        f"""
+        DO $$ BEGIN
+            EXECUTE format('COMMENT ON TABLE {LINKS_TABLE} IS %L',
+                           '{BACKFILL_DONE_MARKER} ' || to_char(now(), 'YYYY-MM-DD HH24:MI TZ'));
+        END $$
+        """
+    )
 
 
 async def _backfill_missing(conn: Any, timeout: float, force: bool = False) -> tuple[int, int]:
