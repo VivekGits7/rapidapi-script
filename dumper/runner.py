@@ -37,6 +37,7 @@ from dumper.id_utils import new_id
 from dumper.key_manager import api_key_manager
 from dumper.rate_limiter import configure_bucket
 from dumper.schema import ensure_browse_schema
+from dumper.search_sync import ensure_search_schema, refresh_search_vocab
 from dumper.state import DumpPhase, DumpEntityState, DumpStage, StopRequested
 from dumper import product_names, targets
 from dumper.http_client import close_http_client
@@ -195,6 +196,8 @@ async def dump_main(
     await api_key_manager.setup()
     # The backend's browse queries depend on this index, link table, and triggers; make sure this DB has them.
     await ensure_browse_schema()
+    # Same deal for search: the covering ranking index, the vehicle aliases, and the vocab view.
+    await ensure_search_schema()
 
     # Pin the active vehicle type for THIS process: get_active_vehicle_type() and the
     # details/compat endpoints (details.py) both read settings.DEFAULT_TYPE_ID, so set
@@ -329,6 +332,8 @@ async def dump_main(
             await _run_depth_first(job_id, pc, n_workers, limit, makes, models, check_stop, stop_event, state, active_type_id)
 
         await _refresh_counts(job_id)
+        # Whatever this run dumped is searchable from here on, however the run ends below.
+        await refresh_search_vocab(force=True)
 
         # ---- Outcome ----
         if state["quota_exc"] is not None:
@@ -507,6 +512,8 @@ async def _run_depth_first(job_id: str, pc: dict, n_workers: int, limit: int,
             finally:
                 in_flight.discard(target["target_id"])
             await _refresh_counts(job_id)
+            # Rate limited internally, so long runs surface new models to search while still dumping.
+            await refresh_search_vocab()
 
     await asyncio.gather(*[worker(i + 1) for i in range(n_workers)])
 

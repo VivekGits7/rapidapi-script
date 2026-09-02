@@ -286,7 +286,10 @@ CREATE TABLE rapid_api_category_articles (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (vehicle_id, category_id, article_id)          -- ON CONFLICT DO NOTHING
 );
-CREATE INDEX idx_rapid_api_cat_articles_article  ON rapid_api_category_articles(article_id);
+-- Covering composite: the backend's hierarchy-fit ranking reads (vehicle_id, category_id, rank)
+-- per article straight off this index, no heap visits on the 50M row table.
+CREATE INDEX idx_rapid_api_cat_articles_article
+    ON rapid_api_category_articles(article_id, vehicle_id, category_id, rank);
 -- Category browse and article counts read (category_id, article_id) straight off this index, no heap visits.
 CREATE INDEX idx_rapid_api_cat_articles_category_article ON rapid_api_category_articles(category_id, article_id);
 CREATE INDEX idx_rapid_api_cat_articles_vehicle  ON rapid_api_category_articles(vehicle_id);

@@ -234,14 +234,17 @@ def reset(yes_i_am_sure: bool):
 @click.option("--backfill", is_flag=True, default=False, help="Also backfill the link table from the existing link rows (hours on a slow disk; backfill_category_links.py shows progress).")
 @click.option("--reconcile", is_flag=True, default=False, help="Force a full per category backfill pass even if one already completed (walks the whole link index).")
 def ensure_schema(backfill: bool, reconcile: bool):
-    """Create or repair the browse index, link table, and triggers the Kalaax backend reads. Safe anytime; run does this too."""
+    """Create or repair the browse and search objects the Kalaax backend reads. Safe anytime; run does this too."""
     from dumper.schema import ensure_browse_schema
+    from dumper.search_sync import ensure_search_schema
     from services.db import close_db_pool, create_db_pool
 
     async def _run() -> dict:
         await create_db_pool(max_size=2)
         try:
-            return await ensure_browse_schema(backfill=backfill, reconcile=reconcile)
+            browse = await ensure_browse_schema(backfill=backfill, reconcile=reconcile)
+            search = await ensure_search_schema()
+            return {"browse": browse, "search": search}
         finally:
             await close_db_pool()
 

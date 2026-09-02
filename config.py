@@ -116,6 +116,7 @@ class Settings(BaseSettings):
     POSTGRES_POOL_MAX: int = Field(default=30, description="asyncpg pool max connections")
     POSTGRES_COMMAND_TIMEOUT: float = Field(default=120.0, description="Per-query timeout (s) — generous for a remote DB link")
     SCHEMA_DDL_TIMEOUT: float = Field(default=3600.0, description="Timeout (s) for the browse index build and link table backfill run at dump start on a big catalog")
+    SEARCH_VOCAB_REFRESH_MINUTES: int = Field(default=60, description="Minutes between search vocab view refreshes while dumping, 0 leaves freshness to the backend's hourly job")
 
     # ==================== TARGET FILTER (dump_targets.csv) ====================
     DUMP_TARGETS_CSV: str = Field(default="dump_targets.csv", description="Path to the make/model target seed CSV")

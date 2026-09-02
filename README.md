@@ -73,7 +73,12 @@ guvrun -m dumper.cli status          # latest job state + counts
 guvrun -m dumper.cli counts          # API usage, monthly ceiling, target progress
 guvrun -m dumper.cli stop            # graceful stop (pauses at next checkpoint)
 guvrun -m dumper.cli reset --yes-i-am-sure   # DANGER: truncate all dump tables
-guvrun -m dumper.cli ensure-schema   # create/repair the browse index, link table and triggers the backend reads (run does this at startup); --backfill also fills the table
+guvrun -m dumper.cli ensure-schema   # create/repair the browse + search objects the backend reads (run does this at startup); --backfill also fills the link table
+                                     # search side: the covering (article_id, vehicle_id, category_id, rank) ranking index, the search_vehicle_aliases table
+                                     # (VERNA = HYUNDAI ACCENT), and the search_vehicle_vocab view with its alias rows. While `run` dumps, the vocab view is
+                                     # refreshed every SEARCH_VOCAB_REFRESH_MINUTES (=60, 0 = off) and once at run end, so new models become searchable without
+                                     # waiting for the backend's hourly job. Article indexing itself is queue-driven by the backend's triggers; EMBEDDINGS are
+                                     # deliberately NOT generated here - run the backend's backfill_search_index.py (or its 30s worker) separately for those.
 guvrun backfill_category_links.py    # link table backfill, server side loop + parallel workers, live progress bar; --status shows how far it is
 ```
 
