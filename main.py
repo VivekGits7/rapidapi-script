@@ -20,7 +20,10 @@ from config import settings
 from error import setup_error_handlers
 from limiter import limiter
 from logger import get_logger, setup_logging
-from middleware.request_logging import RequestLoggingMiddleware, SecurityHeadersMiddleware
+from middleware.request_logging import (
+    RequestLoggingMiddleware,
+    SecurityHeadersMiddleware,
+)
 from routers.dump import router as dump_router
 from services.db import close_db_pool, create_db_pool, execute_command
 
@@ -47,7 +50,9 @@ async def lifespan(app: FastAPI):
         """
     )
     if reconciled and reconciled != "UPDATE 0":
-        logger.warning(f"Lifespan: reconciled orphaned running job(s) → paused ({reconciled})")
+        logger.warning(
+            f"Lifespan: reconciled orphaned running job(s) → paused ({reconciled})"
+        )
     yield
     await close_db_pool()
     logger.info("Lifespan: DB pool closed")
